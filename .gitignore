@@ -1,0 +1,35 @@
+# Build output
+build/
+out/
+compile_commands.json
+
+# Editor / tooling caches
+.cache/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+
+# Local data (ITCH sample files, journals, snapshots): large, never committed
+data/*
+!data/.gitkeep
+*.journal
+*.snapshot
+
+# Profiling
+perf.data*
+*.svg.tmp
+
+# libFuzzer artifacts
+crash-*
+leak-*
+timeout-*
+oom-*
+fuzz/corpus/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.so
