@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.preset }} / ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, release, asan, tsan]
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cc: gcc-14
+            cxx: g++-14
+          - compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # Ubuntu 24.04 runners use high ASLR entropy, which makes ThreadSanitizer
+      # abort with "unexpected memory mapping". Lowering it is the standard workaround.
+      - name: Lower ASLR entropy for TSan
+        if: matrix.preset == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake --preset ${{ matrix.preset }}
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}

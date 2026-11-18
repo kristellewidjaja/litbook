@@ -33,3 +33,8 @@ __pycache__/
 *.pyc
 .venv/
 *.so
+
+# Personal study notes and planning (kept local)
+docs/learn/
+docs/ROADMAP.md
+docs/PROGRESS.md

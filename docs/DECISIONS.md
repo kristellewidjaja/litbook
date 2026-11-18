@@ -33,3 +33,43 @@ Each entry: date, context, options considered, choice, reason. Newest at the bot
 **Options:** ringmatch (from the ring buffers used between threads), litbook.
 **Choice:** litbook. Namespace `litbook`, headers under `include/litbook/`.
 **Reason:** A "lit" market is one with a publicly visible order book, as opposed to a dark pool where resting orders are hidden. That is exactly what this project builds: a lit venue that publishes its book over a market data feed.
+
+## D-005 (2026-11-18): Build configurations via CMake presets
+**Context:** Four build types are needed (debug, release, ASan+UBSan, TSan) on two compilers.
+**Options:** (1) Document long `cmake -D...` command lines. (2) Shell scripts per configuration. (3) `CMakePresets.json`.
+**Choice:** Presets: `debug`, `release`, `asan`, `tsan` (GCC) plus `-clang` variants, each building into `build/<preset>/` with Ninja.
+**Reason:** Presets are standard CMake, understood by IDEs and CI, and keep every configuration reproducible from one name. ASan and TSan are separate presets because they cannot share a binary (both replace the memory allocator and shadow memory layout).
+Sanitizer flags are applied globally (including GoogleTest), because TSan misses races and reports false positives when only part of the program is instrumented.
+
+## D-006 (2026-11-18): Dependencies via FetchContent, pinned by hash
+**Options:** (1) System packages. (2) vcpkg or Conan. (3) Git submodules. (4) CMake FetchContent.
+**Choice:** FetchContent from release tarballs with SHA-256: GoogleTest v1.17.0, Google Benchmark v1.9.1, declared `SYSTEM` so their headers do not trigger project warnings.
+**Reason:** No extra tool to install or explain; exact versions are pinned; the hash rejects a tampered or changed download. A package manager pays off only with many dependencies. Submodules add a manual `git submodule update` step that is easy to forget.
+
+## D-007 (2026-11-18): Stricter warnings than the minimum
+**Choice:** Beyond `-Wall -Wextra -Wpedantic -Werror`, also `-Wshadow -Wconversion -Wsign-conversion -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual`, applied per target through an interface library (`litbook::warnings`) so third-party code is unaffected.
+**Reason:** Quantities are unsigned. A silent signed/unsigned or 64-to-32-bit conversion in matching code is exactly the bug class `-Wsign-conversion`/`-Wconversion` catch at compile time.
+
+## D-008 (2026-11-18): CI runs on the native GitHub runner, not the dev container
+**Options:** (1) Build the dev container image in CI and run inside it. (2) Use `ubuntu-24.04` runners with their preinstalled GCC 14 and Clang 18.
+**Choice:** Option 2, a matrix of {debug, release, asan, tsan} by {gcc-14, clang-18}.
+**Reason:** Much faster (no image build) and simpler. It also adds coverage: CI is x86-64 while development is arm64, so architecture-specific assumptions get caught. TSan on these runners needs `vm.mmap_rnd_bits=28` (a known ASLR incompatibility).
+
+## D-009 (2026-11-18): One test executable
+**Choice:** A single `litbook_tests` binary with all test files, registered through `gtest_discover_tests(... DISCOVERY_MODE PRE_TEST)`.
+**Reason:** It links fast and every test is still visible to ctest individually. Discovery at test time (not build time) avoids running sanitizer-instrumented binaries during the build. Split into several binaries later only if link times grow.
+
+## D-010 (2026-11-18): Dev image is Ubuntu 26.04 LTS with distro-default compilers
+**Options:** (1) Ubuntu 24.04 (GCC 13/14, Clang 18). (2) Ubuntu 26.04 LTS (GCC 15.2, Clang 21). (3) Install newer compilers from the upstream LLVM apt repository.
+**Choice:** Ubuntu 26.04 LTS with unversioned packages (`g++`, `clang`), installed versions GCC 15.2 and Clang 21.1.8.
+**Reason:** Newest C++20/23 support from the standard archive with no extra package sources. Being newer than CI (GCC 14 and Clang 18 on ubuntu-24.04) is useful, because code must compile on both old and new compilers.
+Verified 2026-11-18: ASan (heap-buffer-overflow), UBSan (signed overflow) and TSan (data race) all detect deliberate bugs inside the Docker Desktop VM with both compilers, and TSan needed no ASLR workaround there.
+
+## D-011 (2026-11-18): `#pragma once` over include guards
+**Choice:** `#pragma once`; clang-tidy's `portability-avoid-pragma-once` is disabled.
+**Reason:** It is supported by every compiler targeted (GCC, Clang) and cannot go wrong by copy-pasting a guard name. Include guards are only needed for exotic compilers or headers reachable through multiple filesystem paths, neither of which applies here.
+
+## D-012 (2026-11-18): Planning notes stay out of the repository
+**Context:** D-002 set up docs for state, plan, rationale and measurements.
+**Choice:** The roadmap, progress notes and study notes are kept locally and gitignored. Only this decisions log and the benchmark log are published.
+**Reason:** The repository should present the engineering record (why things were built this way, and measured results), not personal to-do lists.

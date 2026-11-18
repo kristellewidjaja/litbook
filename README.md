@@ -4,7 +4,7 @@ A low-latency electronic exchange simulator in modern C++ (C++20).
 
 A *lit* market is a venue with a publicly visible order book, as opposed to a dark pool, where resting orders are hidden. litbook is a lit venue: it matches orders with price-time priority and publishes its book to anyone listening on the market data feed.
 
-> **Status:** early development (Phase 0: scaffold). See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and [docs/PROGRESS.md](docs/PROGRESS.md) for the current state.
+> **Status:** early development. The build scaffold is in place and the matching engine is next.
 
 ## Planned components
 - **Matching engine**: a simple reference order book plus a fast, allocation-free book, verified against each other by differential testing and fuzzing
@@ -14,9 +14,13 @@ A *lit* market is a venue with a publicly visible order book, as opposed to a da
 - **Tooling**: a NASDAQ TotalView-ITCH 5.0 replayer, a latency histogram, a load generator, and Python trading bots via pybind11
 
 ## Building
-Build instructions will be added once the scaffold lands. Development targets Linux, with a Docker dev container for macOS hosts.
+Development targets Linux. On macOS or Windows, use the Docker dev container (Ubuntu 26.04, GCC 15, Clang 21):
+```sh
+./scripts/dev.sh                      # shell inside the container, repo mounted at /work
+cmake --preset debug && cmake --build --preset debug && ctest --preset debug
+```
+Presets: `debug`, `release`, `asan` (AddressSanitizer + UBSan), `tsan` (ThreadSanitizer), each also as `-clang`.
 
 ## Docs
-- [Roadmap](docs/ROADMAP.md)
 - [Design decisions](docs/DECISIONS.md)
 - [Benchmarks](docs/BENCHMARKS.md): every number comes from a recorded run
