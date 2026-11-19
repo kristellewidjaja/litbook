@@ -2,6 +2,7 @@
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/listener.hpp"
+#include "litbook/book/order_book.hpp"
 #include "litbook/book/order_request.hpp"
 #include "litbook/types.hpp"
 
@@ -16,21 +17,14 @@
 
 namespace litbook {
 
-// Aggregated view of one price level.
-struct LevelSummary {
-    Price price;
-    AggregateQty total_qty;
-    std::uint32_t order_count;
-    bool operator==(const LevelSummary&) const = default;
-};
-
 // Single-symbol limit order book with price-then-time priority, built from standard
 // containers. This is the *correctness reference*: simple enough to trust, and every
 // faster book must produce exactly the same event stream (contract in events.hpp).
 //
 // Supports limit and market orders; GoodTillCancel, IOC and FOK; post-only; cancel;
 // modify (a quantity decrease at the same price keeps queue priority, anything else
-// loses it); self-trade prevention; tick- and lot-size validation.
+// loses it); self-trade prevention; tick- and lot-size validation; a price band and a
+// maximum number of resting orders (BookConfig).
 //
 // Invariants (verified by check_invariants(), true whenever no call is in progress):
 //   1. Never crossed: if both sides are non-empty, best_bid() < best_ask().
@@ -39,13 +33,14 @@ struct LevelSummary {
 //   4. A level's total_qty equals the sum of its orders' remaining quantities.
 //   5. Within a level, orders are in priority order (earliest first).
 //   6. The ID index has exactly one entry per resting order, pointing at that order.
-//   7. Every resting price is a multiple of tick_size; every remaining quantity is a
-//      multiple of lot_size.
+//   7. Every resting price is a multiple of tick_size and inside [min_price, max_price];
+//      every remaining quantity is a multiple of lot_size.
+//   8. order_count() <= max_orders.
 //
 // Not thread-safe. Events go synchronously to the listener, which must outlive the book.
 class MapOrderBook {
 public:
-    // Throws std::invalid_argument if config.tick_size < 1 or config.lot_size < 1
+    // Throws std::invalid_argument if validate_config rejects `config`
     // (construction is startup, not the hot path).
     explicit MapOrderBook(OrderBookListener& listener, BookConfig config = {});
 
@@ -118,6 +113,7 @@ private:
 
     [[nodiscard]] std::optional<RejectReason> validate(const OrderRequest& request) const;
     [[nodiscard]] bool valid_price(Price price) const noexcept;
+    [[nodiscard]] bool in_band(Price price) const noexcept;
     [[nodiscard]] bool valid_qty(Qty qty) const noexcept;
     [[nodiscard]] bool would_cross(Side side, Price price) const noexcept;
     [[nodiscard]] bool can_fill_completely(const Aggressor& aggressor) const;
@@ -141,5 +137,7 @@ private:
     std::unordered_map<OrderId, Location> index_;
     MatchId next_match_id_ = 1;
 };
+
+static_assert(OrderBook<MapOrderBook>);
 
 }  // namespace litbook

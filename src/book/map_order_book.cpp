@@ -6,7 +6,6 @@
 #include <iterator>
 #include <limits>
 #include <optional>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -34,12 +33,7 @@ constexpr bool is_self_trade(OwnerId a, OwnerId b) noexcept {
 
 MapOrderBook::MapOrderBook(OrderBookListener& listener, BookConfig config)
     : listener_(&listener), config_(config) {
-    if (config_.tick_size < 1) {
-        throw std::invalid_argument("BookConfig::tick_size must be >= 1");
-    }
-    if (config_.lot_size < 1) {
-        throw std::invalid_argument("BookConfig::lot_size must be >= 1");
-    }
+    validate_config(config_);
 }
 
 template <class F>
@@ -56,6 +50,10 @@ decltype(auto) MapOrderBook::with_levels(Side side, F&& f) const {
 
 bool MapOrderBook::valid_price(Price price) const noexcept {
     return price % config_.tick_size == 0;  // also correct for negative prices
+}
+
+bool MapOrderBook::in_band(Price price) const noexcept {
+    return price >= config_.min_price && price <= config_.max_price;
 }
 
 bool MapOrderBook::valid_qty(Qty qty) const noexcept {
@@ -80,6 +78,9 @@ std::optional<RejectReason> MapOrderBook::validate(const OrderRequest& request) 
     }
     if (request.type == OrderType::Limit && !valid_price(request.price)) {
         return RejectReason::InvalidPrice;
+    }
+    if (request.type == OrderType::Limit && !in_band(request.price)) {
+        return RejectReason::PriceOutOfRange;
     }
     if (!valid_qty(request.qty)) {
         return RejectReason::InvalidLotSize;
@@ -155,13 +156,14 @@ void MapOrderBook::submit(const OrderRequest& request) {
         return;
     }
     const bool may_rest = !is_market && request.tif == TimeInForce::GoodTillCancel;
-    if (may_rest) {
+    if (may_rest && index_.size() < config_.max_orders) {
         rest(aggressor, request.post_only);
     } else {
-        listener_->on_canceled({.order_id = aggressor.id,
-                                .canceled_qty = aggressor.remaining,
-                                .remaining_qty = 0,
-                                .reason = CancelReason::Unfilled});
+        listener_->on_canceled(
+            {.order_id = aggressor.id,
+             .canceled_qty = aggressor.remaining,
+             .remaining_qty = 0,
+             .reason = may_rest ? CancelReason::BookFull : CancelReason::Unfilled});
     }
 }
 
@@ -206,6 +208,9 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     if (!valid_price(new_price)) {
         return reject(RejectReason::InvalidPrice);
     }
+    if (!in_band(new_price)) {
+        return reject(RejectReason::PriceOutOfRange);
+    }
     if (!valid_qty(new_qty)) {
         return reject(RejectReason::InvalidLotSize);
     }
@@ -245,6 +250,8 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     if (keeps_priority) {
         return;
     }
+    // The order left the book above, so its slot is free: re-resting cannot exceed
+    // max_orders and needs no capacity check.
     Aggressor aggressor{.id = id,
                         .owner = order.owner,
                         .side = location.side,
@@ -441,7 +448,7 @@ std::size_t MapOrderBook::level_count(Side side) const noexcept {
 template <class Levels>
 bool MapOrderBook::check_side(const Levels& levels, Side side, std::size_t& orders_seen) const {
     for (const auto& [price, level] : levels) {
-        if (level.orders.empty() || !valid_price(price)) {
+        if (level.orders.empty() || !valid_price(price) || !in_band(price)) {
             return false;  // invariants 2, 7
         }
         AggregateQty sum = 0;
@@ -475,7 +482,7 @@ bool MapOrderBook::check_invariants() const {
     // Invariant 6, other direction: no index entries for orders that are not in the book.
     // (Invariant 5, priority order, is enforced structurally by push_back-only insertion
     // and is tested behaviorally.)
-    return orders_seen == index_.size();
+    return orders_seen == index_.size() && index_.size() <= config_.max_orders;  // 6, 8
 }
 
 }  // namespace litbook

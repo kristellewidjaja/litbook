@@ -21,7 +21,9 @@ include(Dependencies)
 # ---- Core library -----------------------------------------------------------
 add_library(litbook STATIC
     src/version.cpp
+    src/book/book_config.cpp
     src/book/events.cpp
+    src/book/fast_order_book.cpp
     src/book/map_order_book.cpp)
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -128,3 +128,26 @@ Verified 2026-11-18: ASan (heap-buffer-overflow), UBSan (signed overflow) and TS
 ## D-024 (2026-11-18): Coverage assertions in the model test
 **Choice:** Each random workload counts the events and paths it produced (trades, STP actions, priority-keeping vs priority-losing modifies, each reject reason) and fails if a path it should cover never occurred.
 **Reason:** A random test that never reaches a rule passes vacuously. The first run proved the point: priority-keeping modifies occurred 0 to 7 times per 20,000 operations because random prices rarely matched the order's own price. The generator now targets each order's last known price half of the time.
+
+## D-025 (2026-11-18): Common book interface as a C++20 concept (static polymorphism)
+**Options:** (1) An abstract base class `OrderBook` with virtual `submit`/`cancel`/`modify`. (2) A concept `OrderBook<Book>` that both books satisfy; generic code is a template.
+**Choice:** (2), in `order_book.hpp`, checked with `static_assert` next to each book. The shared tests are GoogleTest typed tests over `BookTypes = {MapOrderBook, FastOrderBook}`.
+**Reason:** Calls are resolved at compile time and can be inlined; a virtual call is an indirect branch per operation and blocks inlining. Nothing needs to pick a book at run time. The listener stays virtual for now (one indirect call per event); Phase 4 measures whether that matters.
+
+## D-026 (2026-11-18): Price band and capacity are book rules, enforced by every book
+**Choice:** `BookConfig` gains `min_price`/`max_price` (limit prices outside: `PriceOutOfRange`, checked after the tick check and before the lot check, for submit and modify) and `max_orders` (a remainder that would rest in a full book: `OrderCanceled(BookFull)` after any trading). Defaults are unbounded, so existing users of `MapOrderBook` see no change. All three books (naive, map, fast) implement both, so the differential tests cover them.
+**Rejected:** limits known only to `FastOrderBook` (the books would then disagree on those inputs and the differential test could not cover the paths); rejecting new orders up front when the book is full (a full book could then not even accept orders that would trade and free space).
+**Note:** an order that trades never ends up `BookFull`: having a remainder means every order it crossed was used up, which freed at least as many slots as it needs.
+
+## D-027 (2026-11-18): `FastOrderBook` layout
+**Choice:** per side, a flat array with one level per tick in the band plus an occupancy bitmap; an index-based pool of 32-byte order nodes with intrusive doubly linked FIFO lists per level; a fixed-capacity open-addressing hash map (`FlatIdMap`) from order ID to node. All sized in the constructor from `BookConfig`; the constructor throws for an unbounded or too-wide band (more than 2^22 levels), a band not on tick, or `max_orders` above 2^24.
+**Rejected:** a tree of levels (O(log n), node per level); `std::list` per level (allocation per order, scattered memory); `std::unordered_map` (a node allocation per insert); a direct array indexed by order ID (client IDs are sparse and reused).
+**Details:** 32-bit indexes instead of pointers (half the size, survive moves, checkable). LIFO free list (reuses cache-warm slots). Best price moves to the next occupied level 64 levels per step via `countr_zero`/`countl_zero`; a two-level bitmap would bound that further and is not needed yet. `FlatIdMap` uses Fibonacci hashing, at most 50% load, and backward-shift deletion (no tombstones).
+
+## D-028 (2026-11-18): Proving "no allocation after startup"
+**Choice:** a separate test executable replaces the global `operator new`/`delete` with counting versions, arms the counter around replaying every standard workload into a `FastOrderBook`, and requires zero. Positive controls: a test that the counter sees an allocation, and a test that `MapOrderBook` does allocate. Not built under TSan (Clang's static TSan runtime defines `operator new`, so it cannot be replaced; the test is single-threaded anyway).
+**Reason:** A rule that is only reviewed, not tested, regresses silently.
+
+## D-029 (2026-11-18): Differential testing in two layers
+**Choice:** (1) The model test replays each workload into the naive oracle, `MapOrderBook` and `FastOrderBook`, comparing events and queries after every operation (20,000 operations per workload; each workload's band is its generated price range plus a 10-tick margin so the per-operation invariant check stays cheap). (2) A long test compares only `FastOrderBook` with `MapOrderBook` on streamed operations (default 100,000 per workload, `LITBOOK_DIFF_OPS` for more), checking invariants every 4,096 operations.
+**Reason:** The naive oracle is O(n) per operation, so it cannot run millions of operations; the map book is trusted because it matches the oracle.

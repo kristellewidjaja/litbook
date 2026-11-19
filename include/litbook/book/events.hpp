@@ -2,6 +2,7 @@
 
 #include "litbook/types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 
@@ -16,13 +17,18 @@ enum class RejectReason : std::uint8_t {
     InvalidLotSize,      // quantity is not a multiple of the lot size
     InvalidOrderType,    // contradictory combination, e.g. post-only market order
     PostOnlyWouldCross,  // post-only order (or modify of one) would trade on arrival
+    PriceOutOfRange,     // limit price outside the book's [min_price, max_price] band
 };
+
+// Number of RejectReason values (for tables indexed by reason).
+inline constexpr std::size_t kRejectReasonCount = 8;
 
 // Why quantity left the book without trading.
 enum class CancelReason : std::uint8_t {
     UserRequested,        // cancel() was called
     Unfilled,             // IOC / FOK / market remainder that could not trade immediately
     SelfTradePrevention,  // removed by the self-trade prevention policy
+    BookFull,             // would rest, but the book already holds max_orders resting orders
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +49,8 @@ enum class CancelReason : std::uint8_t {
 //                           Decrement:    OrderCanceled(resting, partial), LevelUpdate,
 //                                         OrderCanceled(aggressor, partial)
 //                     then for any remainder: LevelUpdate(own side) if it rests
-//                     (limit + GoodTillCancel), else OrderCanceled(Unfilled).
+//                     (limit + GoodTillCancel), OrderCanceled(BookFull) if it would rest
+//                     but the book already holds max_orders, else OrderCanceled(Unfilled).
 // cancel, found:      OrderCanceled(UserRequested), LevelUpdate
 // cancel, not found:  CancelRejected
 // modify, invalid:    ModifyRejected

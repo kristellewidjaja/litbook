@@ -35,6 +35,8 @@ public:
             reject = RejectReason::InvalidOrderType;
         } else if (r.type == OrderType::Limit && r.price % config_.tick_size != 0) {
             reject = RejectReason::InvalidPrice;
+        } else if (r.type == OrderType::Limit && !in_band(r.price)) {
+            reject = RejectReason::PriceOutOfRange;
         } else if (r.qty % config_.lot_size != 0) {
             reject = RejectReason::InvalidLotSize;
         } else if (find(r.id) != nullptr) {
@@ -73,7 +75,11 @@ public:
             return;
         }
         if (!market && r.tif == TimeInForce::GoodTillCancel) {
-            add_resting(in, r.post_only);
+            if (orders_.size() >= config_.max_orders) {
+                canceled(in.id, in.left, 0, CancelReason::BookFull);
+            } else {
+                add_resting(in, r.post_only);
+            }
         } else {
             canceled(in.id, in.left, 0, CancelReason::Unfilled);
         }
@@ -100,6 +106,8 @@ public:
             reject = RejectReason::ZeroQuantity;
         } else if (price % config_.tick_size != 0) {
             reject = RejectReason::InvalidPrice;
+        } else if (!in_band(price)) {
+            reject = RejectReason::PriceOutOfRange;
         } else if (qty % config_.lot_size != 0) {
             reject = RejectReason::InvalidLotSize;
         } else if (o->post_only && first_crossing(o->side, price, false) != nullptr) {
@@ -170,6 +178,10 @@ private:
         bool market;
         Qty left;
     };
+
+    [[nodiscard]] bool in_band(Price p) const {
+        return config_.min_price <= p && p <= config_.max_price;
+    }
 
     static bool same_owner(OwnerId a, OwnerId b) { return a != kNoOwner && a == b; }
 

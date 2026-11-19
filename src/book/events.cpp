@@ -59,6 +59,8 @@ std::ostream& operator<<(std::ostream& os, RejectReason reason) {
             return os << "InvalidOrderType";
         case RejectReason::PostOnlyWouldCross:
             return os << "PostOnlyWouldCross";
+        case RejectReason::PriceOutOfRange:
+            return os << "PriceOutOfRange";
     }
     return os << "RejectReason(" << static_cast<int>(reason) << ")";
 }
@@ -71,6 +73,8 @@ std::ostream& operator<<(std::ostream& os, CancelReason reason) {
             return os << "Unfilled";
         case CancelReason::SelfTradePrevention:
             return os << "SelfTradePrevention";
+        case CancelReason::BookFull:
+            return os << "BookFull";
     }
     return os << "CancelReason(" << static_cast<int>(reason) << ")";
 }
