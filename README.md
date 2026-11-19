@@ -4,7 +4,7 @@ A low-latency electronic exchange simulator in modern C++ (C++20).
 
 A *lit* market is a venue with a publicly visible order book, as opposed to a dark pool, where resting orders are hidden. litbook is a lit venue: it matches orders with price-time priority and publishes its book to anyone listening on the market data feed.
 
-> **Status:** early development. The reference order book (price-time priority matching, cancels, full event stream) is done; order types and a fast book are next.
+> **Status:** early development. The reference order book is done: price-time priority matching, market / IOC / FOK / post-only orders, modify with queue-priority rules, self-trade prevention, and tick/lot validation. A fast allocation-free book is next.
 
 ## Planned components
 - **Matching engine**: a simple reference order book plus a fast, allocation-free book, verified against each other by differential testing and fuzzing

@@ -19,6 +19,8 @@ public:
     virtual void on_trade(const Trade& /*event*/) {}
     virtual void on_canceled(const OrderCanceled& /*event*/) {}
     virtual void on_cancel_rejected(const CancelRejected& /*event*/) {}
+    virtual void on_modified(const OrderModified& /*event*/) {}
+    virtual void on_modify_rejected(const ModifyRejected& /*event*/) {}
     virtual void on_level_update(const LevelUpdate& /*event*/) {}
 
 protected:

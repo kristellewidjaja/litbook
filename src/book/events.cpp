@@ -1,5 +1,6 @@
 #include "litbook/book/events.hpp"
 
+#include "litbook/book/book_config.hpp"
 #include "litbook/book/recording_listener.hpp"
 #include "litbook/types.hpp"
 
@@ -12,6 +13,36 @@ std::ostream& operator<<(std::ostream& os, Side side) {
     return os << (side == Side::Buy ? "Buy" : "Sell");
 }
 
+std::ostream& operator<<(std::ostream& os, OrderType type) {
+    return os << (type == OrderType::Limit ? "Limit" : "Market");
+}
+
+std::ostream& operator<<(std::ostream& os, TimeInForce tif) {
+    switch (tif) {
+        case TimeInForce::GoodTillCancel:
+            return os << "GTC";
+        case TimeInForce::ImmediateOrCancel:
+            return os << "IOC";
+        case TimeInForce::FillOrKill:
+            return os << "FOK";
+    }
+    return os << "TimeInForce(" << static_cast<int>(tif) << ")";
+}
+
+std::ostream& operator<<(std::ostream& os, SelfTradePolicy policy) {
+    switch (policy) {
+        case SelfTradePolicy::CancelNewest:
+            return os << "CancelNewest";
+        case SelfTradePolicy::CancelOldest:
+            return os << "CancelOldest";
+        case SelfTradePolicy::CancelBoth:
+            return os << "CancelBoth";
+        case SelfTradePolicy::Decrement:
+            return os << "Decrement";
+    }
+    return os << "SelfTradePolicy(" << static_cast<int>(policy) << ")";
+}
+
 std::ostream& operator<<(std::ostream& os, RejectReason reason) {
     switch (reason) {
         case RejectReason::DuplicateOrderId:
@@ -20,13 +51,34 @@ std::ostream& operator<<(std::ostream& os, RejectReason reason) {
             return os << "ZeroQuantity";
         case RejectReason::UnknownOrderId:
             return os << "UnknownOrderId";
+        case RejectReason::InvalidPrice:
+            return os << "InvalidPrice";
+        case RejectReason::InvalidLotSize:
+            return os << "InvalidLotSize";
+        case RejectReason::InvalidOrderType:
+            return os << "InvalidOrderType";
+        case RejectReason::PostOnlyWouldCross:
+            return os << "PostOnlyWouldCross";
     }
     return os << "RejectReason(" << static_cast<int>(reason) << ")";
 }
 
+std::ostream& operator<<(std::ostream& os, CancelReason reason) {
+    switch (reason) {
+        case CancelReason::UserRequested:
+            return os << "UserRequested";
+        case CancelReason::Unfilled:
+            return os << "Unfilled";
+        case CancelReason::SelfTradePrevention:
+            return os << "SelfTradePrevention";
+    }
+    return os << "CancelReason(" << static_cast<int>(reason) << ")";
+}
+
 std::ostream& operator<<(std::ostream& os, const OrderAccepted& e) {
-    return os << "Accepted{id=" << e.order_id << ' ' << e.side << ' ' << e.qty << '@' << e.price
-              << '}';
+    return os << "Accepted{id=" << e.order_id << " owner=" << e.owner << ' ' << e.side << ' '
+              << e.type << ' ' << e.tif << (e.post_only ? " post-only " : " ") << e.qty << '@'
+              << e.price << '}';
 }
 
 std::ostream& operator<<(std::ostream& os, const OrderRejected& e) {
@@ -41,11 +93,21 @@ std::ostream& operator<<(std::ostream& os, const Trade& e) {
 }
 
 std::ostream& operator<<(std::ostream& os, const OrderCanceled& e) {
-    return os << "Canceled{id=" << e.order_id << " qty=" << e.canceled_qty << '}';
+    return os << "Canceled{id=" << e.order_id << " qty=" << e.canceled_qty
+              << " left=" << e.remaining_qty << ' ' << e.reason << '}';
 }
 
 std::ostream& operator<<(std::ostream& os, const CancelRejected& e) {
     return os << "CancelRejected{id=" << e.order_id << ' ' << e.reason << '}';
+}
+
+std::ostream& operator<<(std::ostream& os, const OrderModified& e) {
+    return os << "Modified{id=" << e.order_id << ' ' << e.side << ' ' << e.qty << '@' << e.price
+              << (e.kept_priority ? " kept-priority" : " lost-priority") << '}';
+}
+
+std::ostream& operator<<(std::ostream& os, const ModifyRejected& e) {
+    return os << "ModifyRejected{id=" << e.order_id << ' ' << e.reason << '}';
 }
 
 std::ostream& operator<<(std::ostream& os, const LevelUpdate& e) {

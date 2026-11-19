@@ -7,28 +7,62 @@
 
 namespace litbook {
 
-// Why a new order or a cancel was refused.
+// Why a new order, cancel or modify was refused.
 enum class RejectReason : std::uint8_t {
-    DuplicateOrderId,  // a resting order already has this ID
-    ZeroQuantity,      // quantity must be at least 1
-    UnknownOrderId,    // cancel for an ID that is not resting (never existed, filled, or canceled)
+    DuplicateOrderId,    // a resting order already has this ID
+    ZeroQuantity,        // quantity must be at least 1
+    UnknownOrderId,      // cancel/modify for an ID that is not resting
+    InvalidPrice,        // limit price is not a multiple of the tick size
+    InvalidLotSize,      // quantity is not a multiple of the lot size
+    InvalidOrderType,    // contradictory combination, e.g. post-only market order
+    PostOnlyWouldCross,  // post-only order (or modify of one) would trade on arrival
+};
+
+// Why quantity left the book without trading.
+enum class CancelReason : std::uint8_t {
+    UserRequested,        // cancel() was called
+    Unfilled,             // IOC / FOK / market remainder that could not trade immediately
+    SelfTradePrevention,  // removed by the self-trade prevention policy
 };
 
 // ---------------------------------------------------------------------------
 // Events emitted by an order book. Plain values: cheap to copy, comparable.
 //
-// Ordering contract for one call (identical for every book implementation):
-//   add_limit, rejected:  OrderRejected
-//   add_limit, accepted:  OrderAccepted, then per fill {Trade, LevelUpdate(resting side)},
-//                         then LevelUpdate(own side) if any quantity rests
-//   cancel, found:        OrderCanceled, LevelUpdate
-//   cancel, not found:    CancelRejected
+// Ordering contract (identical for every book implementation):
+//
+// submit, invalid:    OrderRejected
+// submit, valid:      OrderAccepted, then
+//                     FOK that cannot fill completely: OrderCanceled(Unfilled), stop.
+//                     Otherwise, walking resting orders in priority order:
+//                       - different owner: Trade, LevelUpdate(resting side)
+//                       - same owner (self-trade), by policy:
+//                           CancelNewest: OrderCanceled(aggressor); stop
+//                           CancelOldest: OrderCanceled(resting), LevelUpdate
+//                           CancelBoth:   OrderCanceled(resting), LevelUpdate,
+//                                         OrderCanceled(aggressor); stop
+//                           Decrement:    OrderCanceled(resting, partial), LevelUpdate,
+//                                         OrderCanceled(aggressor, partial)
+//                     then for any remainder: LevelUpdate(own side) if it rests
+//                     (limit + GoodTillCancel), else OrderCanceled(Unfilled).
+// cancel, found:      OrderCanceled(UserRequested), LevelUpdate
+// cancel, not found:  CancelRejected
+// modify, invalid:    ModifyRejected
+// modify, keeps priority (same price, qty not increased):
+//                     OrderModified(kept_priority), LevelUpdate
+// modify, loses priority (price changed or qty increased):
+//                     OrderModified, LevelUpdate(old level), then the order is
+//                     re-entered exactly like a GoodTillCancel limit order from the
+//                     "walking resting orders" step above.
 // ---------------------------------------------------------------------------
 
 struct OrderAccepted {
     OrderId order_id;
+    OwnerId owner;
     Side side;
-    Price price;
+    OrderType type;
+    TimeInForce tif;
+    bool post_only;
+    Price price;  // 0 for market orders
     Qty qty;
     bool operator==(const OrderAccepted&) const = default;
 };
@@ -40,7 +74,8 @@ struct OrderRejected {
 };
 
 // One execution between an incoming (aggressor) order and a resting order.
-// Invariant: price is the resting order's price; qty >= 1.
+// Invariant: price is the resting order's price; qty >= 1; the two owners differ
+// (or at least one is kNoOwner).
 struct Trade {
     MatchId match_id;
     OrderId aggressor_id;
@@ -53,9 +88,13 @@ struct Trade {
     bool operator==(const Trade&) const = default;
 };
 
+// Quantity removed from an order without trading.
+// remaining_qty == 0 means the order is gone; > 0 only for SelfTradePolicy::Decrement.
 struct OrderCanceled {
     OrderId order_id;
-    Qty canceled_qty;  // the quantity that was still resting
+    Qty canceled_qty;
+    Qty remaining_qty;
+    CancelReason reason;
     bool operator==(const OrderCanceled&) const = default;
 };
 
@@ -63,6 +102,22 @@ struct CancelRejected {
     OrderId order_id;
     RejectReason reason;
     bool operator==(const CancelRejected&) const = default;
+};
+
+// A resting order's price and/or remaining quantity changed via modify().
+struct OrderModified {
+    OrderId order_id;
+    Side side;
+    Price price;  // new price
+    Qty qty;      // new remaining quantity
+    bool kept_priority;
+    bool operator==(const OrderModified&) const = default;
+};
+
+struct ModifyRejected {
+    OrderId order_id;
+    RejectReason reason;
+    bool operator==(const ModifyRejected&) const = default;
 };
 
 // New state of one price level. total_qty == 0 and order_count == 0 means the level
@@ -76,11 +131,14 @@ struct LevelUpdate {
 };
 
 std::ostream& operator<<(std::ostream& os, RejectReason reason);
+std::ostream& operator<<(std::ostream& os, CancelReason reason);
 std::ostream& operator<<(std::ostream& os, const OrderAccepted& e);
 std::ostream& operator<<(std::ostream& os, const OrderRejected& e);
 std::ostream& operator<<(std::ostream& os, const Trade& e);
 std::ostream& operator<<(std::ostream& os, const OrderCanceled& e);
 std::ostream& operator<<(std::ostream& os, const CancelRejected& e);
+std::ostream& operator<<(std::ostream& os, const OrderModified& e);
+std::ostream& operator<<(std::ostream& os, const ModifyRejected& e);
 std::ostream& operator<<(std::ostream& os, const LevelUpdate& e);
 
 }  // namespace litbook

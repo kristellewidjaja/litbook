@@ -4,7 +4,8 @@ include(GoogleTest)
 add_executable(litbook_tests
     version_test.cpp
     book/map_order_book_test.cpp
-    book/map_order_book_model_test.cpp)
+    book/map_order_book_model_test.cpp
+    book/map_order_book_rules_test.cpp)
 
 target_include_directories(litbook_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

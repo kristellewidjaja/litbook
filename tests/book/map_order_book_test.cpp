@@ -21,7 +21,7 @@ protected:
     // Runs an operation and returns exactly the events it produced.
     std::vector<BookEvent> add(OrderId id, Side side, Price price, Qty qty) {
         rec_.clear();
-        book_.add_limit(id, side, price, qty);
+        book_.submit({.id = id, .side = side, .price = price, .qty = qty});
         EXPECT_TRUE(book_.check_invariants());
         return rec_.take();
     }
@@ -33,7 +33,14 @@ protected:
     }
 
     static BookEvent accepted(OrderId id, Side side, Price price, Qty qty) {
-        return OrderAccepted{.order_id = id, .side = side, .price = price, .qty = qty};
+        return OrderAccepted{.order_id = id,
+                             .owner = kNoOwner,
+                             .side = side,
+                             .type = OrderType::Limit,
+                             .tif = TimeInForce::GoodTillCancel,
+                             .post_only = false,
+                             .price = price,
+                             .qty = qty};
     }
     static BookEvent level(Side side, Price price, AggregateQty total, std::uint32_t count) {
         return LevelUpdate{.side = side, .price = price, .total_qty = total, .order_count = count};
@@ -263,8 +270,11 @@ TEST_F(MapOrderBookTest, MatchIdsIncreaseAcrossCalls) {
 
 TEST_F(MapOrderBookTest, CancelRemovesRestingOrder) {
     add(1, kBuy, 100, 10);
-    EXPECT_EQ(cancel(1),
-              (Events{OrderCanceled{.order_id = 1, .canceled_qty = 10}, level(kBuy, 100, 0, 0)}));
+    EXPECT_EQ(cancel(1), (Events{OrderCanceled{.order_id = 1,
+                                               .canceled_qty = 10,
+                                               .remaining_qty = 0,
+                                               .reason = CancelReason::UserRequested},
+                                 level(kBuy, 100, 0, 0)}));
     EXPECT_FALSE(book_.contains(1));
     EXPECT_EQ(book_.best_bid(), std::nullopt);
 }
@@ -272,16 +282,22 @@ TEST_F(MapOrderBookTest, CancelRemovesRestingOrder) {
 TEST_F(MapOrderBookTest, CancelLeavesOtherOrdersAtTheLevel) {
     add(1, kSell, 100, 10);
     add(2, kSell, 100, 3);
-    EXPECT_EQ(cancel(1),
-              (Events{OrderCanceled{.order_id = 1, .canceled_qty = 10}, level(kSell, 100, 3, 1)}));
+    EXPECT_EQ(cancel(1), (Events{OrderCanceled{.order_id = 1,
+                                               .canceled_qty = 10,
+                                               .remaining_qty = 0,
+                                               .reason = CancelReason::UserRequested},
+                                 level(kSell, 100, 3, 1)}));
     EXPECT_EQ(book_.best_ask(), 100);
 }
 
 TEST_F(MapOrderBookTest, CancelOfPartiallyFilledOrderCancelsOnlyTheRemainder) {
     add(1, kSell, 100, 10);
     add(2, kBuy, 100, 4);
-    EXPECT_EQ(cancel(1),
-              (Events{OrderCanceled{.order_id = 1, .canceled_qty = 6}, level(kSell, 100, 0, 0)}));
+    EXPECT_EQ(cancel(1), (Events{OrderCanceled{.order_id = 1,
+                                               .canceled_qty = 6,
+                                               .remaining_qty = 0,
+                                               .reason = CancelReason::UserRequested},
+                                 level(kSell, 100, 0, 0)}));
 }
 
 TEST_F(MapOrderBookTest, CancelOfUnknownIdIsRejected) {

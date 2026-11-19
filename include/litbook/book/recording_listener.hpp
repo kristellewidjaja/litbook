@@ -10,8 +10,8 @@
 
 namespace litbook {
 
-using BookEvent =
-    std::variant<OrderAccepted, OrderRejected, Trade, OrderCanceled, CancelRejected, LevelUpdate>;
+using BookEvent = std::variant<OrderAccepted, OrderRejected, Trade, OrderCanceled, CancelRejected,
+                               OrderModified, ModifyRejected, LevelUpdate>;
 
 std::ostream& operator<<(std::ostream& os, const BookEvent& event);
 
@@ -26,6 +26,8 @@ public:
     void on_trade(const Trade& e) override { events_.emplace_back(e); }
     void on_canceled(const OrderCanceled& e) override { events_.emplace_back(e); }
     void on_cancel_rejected(const CancelRejected& e) override { events_.emplace_back(e); }
+    void on_modified(const OrderModified& e) override { events_.emplace_back(e); }
+    void on_modify_rejected(const ModifyRejected& e) override { events_.emplace_back(e); }
     void on_level_update(const LevelUpdate& e) override { events_.emplace_back(e); }
 
     [[nodiscard]] const std::vector<BookEvent>& events() const noexcept { return events_; }

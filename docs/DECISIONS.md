@@ -100,3 +100,31 @@ Verified 2026-11-18: ASan (heap-buffer-overflow), UBSan (signed overflow) and TS
 ## D-018 (2026-11-18): Hand-written exercises live outside the repository
 **Choice:** Each phase's practice function lives in `exercises/phase-N/` (gitignored). Its tests carry the ctest label `exercise`, are excluded from every normal test preset, and run via `ctest --preset exercises`. Project code never depends on exercise code (for example, the project uses `std::bit_ceil`, not the exercise's `next_power_of_two`).
 **Reason:** Unfinished exercises must never break CI or block the next phase, and exercises can be done at any time.
+
+## D-019 (2026-11-18): Order entry through an `OrderRequest` struct
+**Options:** (1) Keep growing `add_limit(id, owner, side, price, qty, type, tif, post_only)`. (2) One struct with named fields.
+**Choice:** `submit(const OrderRequest&)` with designated initializers at call sites; `add_limit` removed.
+**Reason:** Eight positional integer-like arguments make silent swaps (price for quantity) easy. Named fields are self-documenting, adding a field does not break callers, and the struct mirrors the Phase 5 "enter order" message.
+
+## D-020 (2026-11-18): Order type semantics
+- **Market:** no price limit (implemented as an extreme limit so every price crosses); never rests. `GoodTillCancel` on a market order behaves like IOC. `OrderAccepted.price` is 0.
+- **IOC / FOK:** an unfillable remainder or an unfillable FOK is `OrderAccepted` then `OrderCanceled(Unfilled)`. A reject is reserved for invalid requests.
+- **Post-only:** rejected with `PostOnlyWouldCross` if it would trade on arrival, checked against any resting order including the same owner's. Rejected over "sliding" to a non-crossing price for simplicity and explicitness. Only valid with Limit + GTC (`InvalidOrderType` otherwise).
+- **Validation order** (first failure wins, identical for every book): zero qty, invalid type combination, off-tick price (limit only), odd lot, duplicate ID, post-only cross.
+
+## D-021 (2026-11-18): Modify semantics
+**Choice:** `modify(id, new_price, new_qty)`, where `new_qty` is the new *remaining* quantity. Priority is kept only if the price is unchanged and the quantity does not increase (shrink in place). Otherwise the order is removed (event `OrderModified{kept_priority=false}` plus the old level's update) and re-entered as a GTC limit order, so it may trade immediately. Post-only orders cannot be modified into a cross. Invalid modifies emit `ModifyRejected` and change nothing.
+**Reason:** Keeping priority on a shrink harms nobody behind the order; anything else is equivalent to a new order. "Remaining" is unambiguous for partially filled orders.
+
+## D-022 (2026-11-18): Self-trade prevention
+**Choice:** An `owner` field on every order (`kNoOwner` = 0 is exempt) and one book-wide `SelfTradePolicy`: CancelNewest (default), CancelOldest, CancelBoth, Decrement. STP actions are reported as `OrderCanceled(SelfTradePrevention)`; Decrement reports partial cancels via `remaining_qty > 0`. STP also applies when a modify re-enters an order.
+**FOK interaction:** a FOK is killed if a same-owner order lies within the quantity it would need, so a FOK never partially executes and never triggers STP.
+**Reason:** Covers the policies real venues offer. Exempting owner 0 keeps anonymous flow (and the Phase 1 tests) unaffected.
+
+## D-023 (2026-11-18): Tick and lot size live in `BookConfig`
+**Choice:** Prices remain integers in the system's smallest unit; `BookConfig::tick_size` and `lot_size` are per-instrument multiples checked with `%`. Invalid configs (tick or lot < 1) throw `std::invalid_argument` from the constructor, at startup and never on the hot path.
+**Reason:** Separates "the unit prices are expressed in" from "which prices this instrument allows", as real venues do. `x % m == 0` is correct for negative `x` in C++.
+
+## D-024 (2026-11-18): Coverage assertions in the model test
+**Choice:** Each random workload counts the events and paths it produced (trades, STP actions, priority-keeping vs priority-losing modifies, each reject reason) and fails if a path it should cover never occurred.
+**Reason:** A random test that never reaches a rule passes vacuously. The first run proved the point: priority-keeping modifies occurred 0 to 7 times per 20,000 operations because random prices rarely matched the order's own price. The generator now targets each order's last known price half of the time.
