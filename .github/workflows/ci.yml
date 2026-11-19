@@ -44,3 +44,34 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  # Short libFuzzer run of the differential fuzz target (all three books must agree).
+  # The saved inputs in fuzz/seeds and fuzz/regressions also run in every job above as
+  # the FuzzCorpusReplay test; this job searches for new failing inputs.
+  fuzz:
+    name: fuzz / clang
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libclang-rt-18-dev
+
+      - name: Configure
+        run: cmake --preset fuzz -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+
+      - name: Build
+        run: cmake --build --preset fuzz
+
+      - name: Fuzz for 60 seconds
+        run: |
+          mkdir -p corpus artifacts
+          ./build/fuzz/fuzz/book_fuzzer -max_total_time=60 -max_len=1024 -timeout=10 \
+            -artifact_prefix=artifacts/ corpus fuzz/seeds
+
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: artifacts/

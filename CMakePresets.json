@@ -32,7 +32,17 @@
     { "name": "debug-clang",   "displayName": "Debug (Clang)",        "inherits": ["clang", "debug"] },
     { "name": "release-clang", "displayName": "Release -O3 (Clang)",  "inherits": ["clang", "release"] },
     { "name": "asan-clang",    "displayName": "ASan + UBSan (Clang)", "inherits": ["clang", "asan"] },
-    { "name": "tsan-clang",    "displayName": "TSan (Clang)",         "inherits": ["clang", "tsan"] }
+    { "name": "tsan-clang",    "displayName": "TSan (Clang)",         "inherits": ["clang", "tsan"] },
+
+    { "name": "fuzz", "displayName": "libFuzzer + ASan + UBSan (Clang)", "inherits": ["base", "clang"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g",
+        "LITBOOK_SANITIZER": "address,undefined",
+        "LITBOOK_FUZZ": "ON",
+        "LITBOOK_BUILD_TESTS": "OFF",
+        "LITBOOK_BUILD_BENCH": "OFF"
+      } }
   ],
   "buildPresets": [
     { "name": "debug",         "configurePreset": "debug" },
@@ -42,7 +52,8 @@
     { "name": "debug-clang",   "configurePreset": "debug-clang" },
     { "name": "release-clang", "configurePreset": "release-clang" },
     { "name": "asan-clang",    "configurePreset": "asan-clang" },
-    { "name": "tsan-clang",    "configurePreset": "tsan-clang" }
+    { "name": "tsan-clang",    "configurePreset": "tsan-clang" },
+    { "name": "fuzz",          "configurePreset": "fuzz" }
   ],
   "testPresets": [
     {

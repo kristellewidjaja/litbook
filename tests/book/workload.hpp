@@ -18,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "book/book_test_support.hpp"
+#include "book/test_limits.hpp"
 
 namespace litbook::testing {
 

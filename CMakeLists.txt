@@ -15,6 +15,7 @@ option(LITBOOK_BUILD_BENCH "Build benchmarks" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Sanitizers)    # must come before any target so everything is instrumented
+include(Fuzzing)
 include(Warnings)
 include(Dependencies)
 
@@ -37,6 +38,10 @@ endif()
 
 if(LITBOOK_BUILD_BENCH)
     add_subdirectory(bench)
+endif()
+
+if(LITBOOK_BUILD_TESTS OR LITBOOK_FUZZ)
+    add_subdirectory(fuzz)
 endif()
 
 # Optional local practice exercises (not part of the repository). Their tests carry
