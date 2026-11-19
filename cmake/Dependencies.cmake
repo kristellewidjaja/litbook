@@ -1,6 +1,6 @@
 # Third-party dependencies, pinned by version and SHA-256.
-# Allowed dependencies: GoogleTest, Google Benchmark, pybind11 (later). Nothing else
-# without an entry in docs/DECISIONS.md.
+# The allowed dependencies are GoogleTest, Google Benchmark and pybind11 (later). Nothing
+# else is added without an entry in docs/DECISIONS.md.
 
 include(FetchContent)
 
@@ -10,7 +10,7 @@ if(LITBOOK_BUILD_TESTS OR LITBOOK_BUILD_BENCH)
     FetchContent_Declare(googletest
         URL      https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
         URL_HASH SHA256=65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
-        SYSTEM)  # treat its headers as system headers: no project warnings from them
+        SYSTEM)  # its headers count as system headers, so no project warnings
     FetchContent_MakeAvailable(googletest)
 endif()
 

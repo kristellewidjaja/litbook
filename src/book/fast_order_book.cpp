@@ -17,7 +17,7 @@ constexpr bool is_self_trade(OwnerId a, OwnerId b) noexcept {
 
 // Validates everything FastOrderBook needs and returns the ladder size, before any
 // member allocates. Differences are computed in unsigned arithmetic, which cannot
-// overflow even for the full int64 range.
+// overflow even across the full int64 range.
 std::size_t checked_levels(const BookConfig& config) {
     validate_config(config);
     if (config.min_price % config.tick_size != 0 || config.max_price % config.tick_size != 0) {
@@ -46,7 +46,7 @@ FastOrderBook::FastOrderBook(OrderBookListener& listener, BookConfig config)
       pool_(config.max_orders),
       ids_(config.max_orders) {}
 
-// ---- Price <-> ladder index -----------------------------------------------------
+// Converting between prices and ladder indexes.
 
 bool FastOrderBook::on_tick(Price price) const noexcept {
     return price % config_.tick_size == 0;
@@ -79,7 +79,7 @@ bool FastOrderBook::crosses(const Aggressor& aggressor, std::size_t index) noexc
     return aggressor.side == Side::Buy ? index <= aggressor.limit : index >= aggressor.limit;
 }
 
-// ---- Validation (same checks, same order as MapOrderBook) -------------------------
+// Validation. These are the same checks, in the same order, as in MapOrderBook.
 
 std::optional<RejectReason> FastOrderBook::validate(const OrderRequest& request) const noexcept {
     const bool limit = request.type == OrderType::Limit;
@@ -116,8 +116,8 @@ bool FastOrderBook::would_cross(Side side, Price price) const noexcept {
     return side == Side::Buy ? best <= price : best >= price;
 }
 
-// FOK rule, as in MapOrderBook: enough quantity must be reachable, in priority order,
-// before any same-owner order.
+// The FOK rule is the same as in MapOrderBook. Enough quantity must be reachable, in
+// priority order, before any same-owner order.
 bool FastOrderBook::can_fill_completely(const Aggressor& aggressor) const noexcept {
     const Side resting_side = opposite(aggressor.side);
     const Ladder& resting = ladder(resting_side);
@@ -138,7 +138,7 @@ bool FastOrderBook::can_fill_completely(const Aggressor& aggressor) const noexce
     return false;
 }
 
-// ---- Public operations ----------------------------------------------------------
+// Public operations.
 
 void FastOrderBook::submit(const OrderRequest& request) {
     if (const auto reason = validate(request)) {
@@ -194,7 +194,7 @@ void FastOrderBook::cancel(OrderId id) {
         listener_->on_cancel_rejected({.order_id = id, .reason = RejectReason::UnknownOrderId});
         return;
     }
-    const Node order = pool_[n];  // copy: the node is freed below
+    const Node order = pool_[n];  // A copy, because the node is freed below.
     remove(n);
     listener_->on_canceled({.order_id = id,
                             .canceled_qty = order.remaining,
@@ -223,7 +223,7 @@ void FastOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     if (new_qty % config_.lot_size != 0) {
         return reject(RejectReason::InvalidLotSize);
     }
-    const Node order = pool_[n];  // copy: the node may be freed below
+    const Node order = pool_[n];  // A copy, because the node may be freed below.
     if (order.post_only && would_cross(order.side, new_price)) {
         return reject(RejectReason::PostOnlyWouldCross);
     }
@@ -234,7 +234,7 @@ void FastOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
         ladder(order.side).levels[order.level].total_qty -= order.remaining - new_qty;
         pool_[n].remaining = new_qty;
     } else {
-        remove(n);  // loses its place; re-entered below at the new terms
+        remove(n);  // It loses its place and is re-entered below at the new terms.
     }
     listener_->on_modified({.order_id = id,
                             .side = order.side,
@@ -258,7 +258,7 @@ void FastOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     }
 }
 
-// ---- Matching -------------------------------------------------------------------
+// Matching.
 
 void FastOrderBook::match(Aggressor& aggressor) {
     const Side resting_side = opposite(aggressor.side);
@@ -357,10 +357,10 @@ void FastOrderBook::cancel_front(Ladder& resting, Side side, std::size_t index,
     emit_level_update(side, index);
 }
 
-// ---- Resting orders and the intrusive lists ---------------------------------------
+// Resting orders and the intrusive lists.
 
 void FastOrderBook::rest(const Aggressor& aggressor, bool post_only) {
-    const Index n = pool_.acquire();  // never kNone: callers guarantee a free node
+    const Index n = pool_.acquire();  // Never kNone, because callers guarantee a free node.
     pool_[n] = Node{.id = aggressor.id,
                     .owner = aggressor.owner,
                     .remaining = aggressor.remaining,
@@ -369,7 +369,7 @@ void FastOrderBook::rest(const Aggressor& aggressor, bool post_only) {
                     .level = static_cast<std::uint32_t>(aggressor.limit),
                     .side = aggressor.side,
                     .post_only = post_only};
-    ids_.insert(aggressor.id, n);  // cannot fail: the ID was checked, capacity matches the pool
+    ids_.insert(aggressor.id, n);  // Cannot fail, since the ID was checked and capacity matches.
     link_back(ladder(aggressor.side), aggressor.limit, n);
     emit_level_update(aggressor.side, aggressor.limit);
 }
@@ -389,7 +389,7 @@ void FastOrderBook::link_back(Ladder& lad, std::size_t index, Index n) noexcept 
     if (++level.count == 1) {
         lad.occupied.set(index);
         ++lad.level_count;
-        // Bids: best is the highest index. Asks: the lowest (kNoLevel is the largest value).
+        // For bids the best is the highest index, for asks the lowest (kNoLevel is the largest).
         if (node.side == Side::Buy ? (lad.best == kNoLevel || index > lad.best)
                                    : index < lad.best) {
             lad.best = index;
@@ -428,7 +428,7 @@ void FastOrderBook::emit_level_update(Side side, std::size_t index) {
                                 .order_count = level.count});
 }
 
-// ---- Queries ----------------------------------------------------------------------
+// Queries.
 
 std::optional<Price> FastOrderBook::best_bid() const noexcept {
     return bids_.best == kNoLevel ? std::nullopt : std::optional<Price>(to_price(bids_.best));
@@ -461,7 +461,7 @@ std::size_t FastOrderBook::level_count(Side side) const noexcept {
     return ladder(side).level_count;
 }
 
-// ---- Invariants -------------------------------------------------------------------
+// Invariant checks.
 
 bool FastOrderBook::check_side(Side side, std::size_t& orders_seen) const {
     const Ladder& lad = ladder(side);
@@ -470,17 +470,17 @@ bool FastOrderBook::check_side(Side side, std::size_t& orders_seen) const {
     for (std::size_t i = 0; i < levels_; ++i) {
         const Level& level = lad.levels[i];
         if ((level.count > 0) != lad.occupied.test(i)) {
-            return false;  // invariant 2
+            return false;  // Breaks invariant 2.
         }
         if (level.count == 0) {
             if (level.head != kNone || level.tail != kNone || level.total_qty != 0) {
-                return false;  // invariant 3
+                return false;  // Breaks invariant 3.
             }
             continue;
         }
         ++occupied_levels;
         if (side == Side::Buy || best == kNoLevel) {
-            best = i;  // scanning upwards: bids keep the last (highest), asks the first (lowest)
+            best = i;  // Scanning up, bids keep the last (highest), asks the first.
         }
 
         AggregateQty sum = 0;
@@ -488,36 +488,36 @@ bool FastOrderBook::check_side(Side side, std::size_t& orders_seen) const {
         Index prev = kNone;
         for (Index n = level.head; n != kNone; n = pool_[n].next) {
             if (n >= pool_.capacity() || length > pool_.capacity()) {
-                return false;  // bad index or a cycle
+                return false;  // A bad index or a cycle.
             }
             const Node& node = pool_[n];
             if (node.prev != prev || node.remaining == 0 ||
                 node.remaining % config_.lot_size != 0 || node.side != side || node.level != i ||
                 ids_.find(node.id) != n) {
-                return false;  // invariants 3, 4, 5
+                return false;  // Breaks invariant 3, 4 or 5.
             }
             sum += node.remaining;
             ++length;
             prev = n;
         }
         if (prev != level.tail || length != level.count || sum != level.total_qty) {
-            return false;  // invariant 3
+            return false;  // Breaks invariant 3.
         }
         orders_seen += length;
     }
-    return occupied_levels == lad.level_count && best == lad.best;  // invariant 2
+    return occupied_levels == lad.level_count && best == lad.best;  // Invariant 2.
 }
 
 bool FastOrderBook::check_invariants() const {
     if (bids_.best != kNoLevel && asks_.best != kNoLevel && bids_.best >= asks_.best) {
-        return false;  // invariant 1
+        return false;  // Breaks invariant 1.
     }
     std::size_t orders_seen = 0;
     if (!check_side(Side::Buy, orders_seen) || !check_side(Side::Sell, orders_seen)) {
         return false;
     }
     return orders_seen == pool_.in_use() && orders_seen == ids_.size() &&
-           orders_seen <= config_.max_orders;  // invariant 5
+           orders_seen <= config_.max_orders;  // Invariant 5.
 }
 
 }  // namespace litbook

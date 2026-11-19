@@ -4,12 +4,12 @@
 
 namespace litbook {
 
-// Receives every event an order book emits, synchronously, in the order described
-// in events.hpp. Default implementations ignore the event, so a listener overrides
-// only what it needs.
+// Receives every event an order book emits, synchronously, in the order described in
+// events.hpp. The default implementations ignore the event, so a listener overrides only
+// what it needs.
 //
-// Invariant: a listener must not call back into the book that is notifying it
-// (the book is mid-operation and its state is not yet consistent).
+// The one invariant is that a listener must never call back into the book that is
+// notifying it, because the book is mid-operation and its state is not yet consistent.
 class OrderBookListener {
 public:
     virtual ~OrderBookListener() = default;

@@ -45,7 +45,7 @@ TEST(IndexPoolTest, ReusesTheMostRecentlyReleasedSlotFirst) {
     }
     pool.release(1);
     pool.release(3);
-    EXPECT_EQ(pool.acquire(), 3U);  // LIFO: the slot most likely still in cache
+    EXPECT_EQ(pool.acquire(), 3U);  // LIFO order reuses the slot most likely still in cache
     EXPECT_EQ(pool.acquire(), 1U);
     EXPECT_EQ(pool.acquire(), Pool::kNone);
 }
@@ -62,7 +62,8 @@ TEST(IndexPoolTest, SlotsAreWritableAndKeepTheirValue) {
 }
 
 TEST(IndexPoolTest, InvalidCapacityThrows) {
-    EXPECT_THROW(Pool{0}, std::invalid_argument);  // braces: "Pool(x)" can parse as a declaration
+    // Braces are used because "Pool(x)" can parse as a declaration.
+    EXPECT_THROW(Pool{0}, std::invalid_argument);
     EXPECT_THROW(Pool{Pool::kNone}, std::invalid_argument);
 }
 

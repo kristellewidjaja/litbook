@@ -1,22 +1,23 @@
-// Differential fuzz target: the fuzzer's bytes become a book configuration and a
+// This is a differential fuzz target. The fuzzer's bytes become a book configuration and a
 // sequence of operations, which run through the naive oracle, MapOrderBook and
 // FastOrderBook. Any disagreement in events or queries, or a broken invariant, aborts
 // (libFuzzer then saves the input as a crash file).
 //
-// Input encoding (fixed-size records, so a one-byte mutation changes one field of one
-// operation instead of shifting everything after it):
+// The input uses fixed-size records, so a one-byte mutation changes one field of one
+// operation instead of shifting everything after it. The layout is below.
 //
-//   header, 6 bytes: tick | lot | band low | band width | max orders | self-trade policy
-//     (band low is the byte minus 128, in ticks, so bands can be negative)
-//   then 5 bytes per operation:
-//     [0] kind and flags  bits 0-1: 0,1 submit, 2 cancel, 3 modify
-//                         bit 2: sell   bit 3: market   bits 4-5: time in force
-//                         bit 6: post-only
+//   A 6-byte header holds, in order, the tick, lot, band low, band width, max orders and
+//   self-trade policy. Band low is the byte minus 128, in ticks, so bands can be negative.
+//   Then each operation takes 5 bytes.
+//     [0] kind and flags  bits 0-1 give the kind (0 or 1 submit, 2 cancel, 3 modify)
+//                         bit 2 sell, bit 3 market, bits 4-5 time in force
+//                         bit 6 post-only
 //     [1] order ID        1..32 (a small ID space, so duplicates and cancels of live
 //                         orders are common)
 //     [2] price           a tick inside the band or up to 4 ticks outside it
 //     [3] quantity        0..15 lots
-//     [4] owner and odd   bits 0-1: owner 0..3   bit 6: off-lot qty   bit 7: off-tick price
+//     [4] owner and odd   bits 0-1 owner (0..3), bit 6 off-lot quantity,
+//                         bit 7 off-tick price
 //
 // Value ranges are deliberately narrow, so even short inputs reach band edges, a full
 // book, self-trades and duplicate IDs.
@@ -43,12 +44,12 @@ namespace {
 
 constexpr std::size_t kHeaderSize = 6;
 constexpr std::size_t kOpSize = 5;
-constexpr Price kOutsideTicks = 4;  // how far outside the band generated prices reach
+constexpr Price kOutsideTicks = 4;  // how far outside the band generated prices can reach
 
 struct Decoded {
     BookConfig config;
-    Price low_tick = 0;  // band start, in ticks
-    Price width = 1;     // band width in ticks, >= 1
+    Price low_tick = 0;  // the band start, in ticks
+    Price width = 1;     // the band width in ticks, at least 1
 };
 
 Decoded decode_header(std::span<const std::uint8_t, kHeaderSize> h) {
@@ -77,11 +78,11 @@ Op decode_op(const Decoded& d, std::span<const std::uint8_t, kOpSize> b) {
     const Price span = d.width + 2 * kOutsideTicks;
     Price price = (d.low_tick - kOutsideTicks + b[2] % span) * c.tick_size;
     if ((b[4] & 0x80U) != 0 && c.tick_size > 1) {
-        price += 1;  // off tick
+        price += 1;  // move the price off the tick grid
     }
     Qty qty = c.lot_size * (b[3] % 16U);
     if ((b[4] & 0x40U) != 0 && c.lot_size > 1) {
-        qty += 1;  // off lot
+        qty += 1;  // make the quantity not a whole number of lots
     }
     const unsigned tif = (b[0] >> 4U) & 3U;
     const OrderRequest r{.id = 1U + b[1] % 32U,

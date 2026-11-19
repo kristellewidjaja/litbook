@@ -15,10 +15,10 @@ using BookEvent = std::variant<OrderAccepted, OrderRejected, Trade, OrderCancele
 
 std::ostream& operator<<(std::ostream& os, const BookEvent& event);
 
-// Listener that stores every event in arrival order. Used by tests and by the
-// differential test that compares two book implementations.
-// Invariant: events() holds exactly the events received since construction or the
-// last take()/clear(), in order.
+// Listener that stores every event in arrival order. It is used by tests and by the
+// differential test that compares two book implementations. Its invariant is that
+// events() holds exactly the events received since construction or since the last
+// take() or clear(), in order.
 class RecordingListener final : public OrderBookListener {
 public:
     void on_accepted(const OrderAccepted& e) override { events_.emplace_back(e); }

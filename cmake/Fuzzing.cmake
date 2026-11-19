@@ -1,6 +1,6 @@
-# libFuzzer support (`fuzz` preset). Coverage instrumentation is applied to every
-# target, so the fuzzer is guided by coverage of the library code it is testing;
-# only the fuzzer executable links the libFuzzer runtime (-fsanitize=fuzzer).
+# This adds libFuzzer support (`fuzz` preset). Coverage instrumentation is applied to
+# every target, so the fuzzer is guided by coverage of the library code it is testing.
+# Only the fuzzer executable links the libFuzzer runtime (-fsanitize=fuzzer).
 
 option(LITBOOK_FUZZ "Build libFuzzer targets (Clang only)" OFF)
 

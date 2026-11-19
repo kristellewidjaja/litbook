@@ -39,7 +39,7 @@ TEST(OccupancyBitmapTest, SetResetAndTest) {
     bits.reset(64);
     EXPECT_FALSE(bits.test(64));
     bits.set(5);
-    bits.set(5);  // idempotent
+    bits.set(5);  // setting a set bit again changes nothing
     bits.reset(5);
     EXPECT_FALSE(bits.test(5));
 }
@@ -50,7 +50,7 @@ TEST(OccupancyBitmapTest, FindNextIsInclusiveAndCrossesWords) {
     bits.set(64);
     bits.set(299);
     EXPECT_EQ(bits.find_next(0), 3U);
-    EXPECT_EQ(bits.find_next(3), 3U);  // inclusive
+    EXPECT_EQ(bits.find_next(3), 3U);  // the start bit itself counts
     EXPECT_EQ(bits.find_next(4), 64U);
     EXPECT_EQ(bits.find_next(65), 299U);  // skips whole empty words
     EXPECT_EQ(bits.find_next(300), kNotFound);
@@ -63,10 +63,10 @@ TEST(OccupancyBitmapTest, FindPrevIsInclusiveAndCrossesWords) {
     bits.set(63);
     bits.set(200);
     EXPECT_EQ(bits.find_prev(299), 200U);
-    EXPECT_EQ(bits.find_prev(200), 200U);  // inclusive
+    EXPECT_EQ(bits.find_prev(200), 200U);  // the start bit itself counts
     EXPECT_EQ(bits.find_prev(199), 63U);
     EXPECT_EQ(bits.find_prev(62), 0U);
-    EXPECT_EQ(bits.find_prev(kNotFound), 200U);  // past the end searches from the last bit
+    EXPECT_EQ(bits.find_prev(kNotFound), 200U);  // a start past the end searches from the last bit
     bits.reset(0);
     EXPECT_EQ(bits.find_prev(62), kNotFound);
 }

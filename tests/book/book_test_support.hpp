@@ -18,10 +18,10 @@
 
 namespace litbook::testing {
 
-// Every implementation the shared (typed) tests run against.
+// This is the list of book implementations that the shared typed tests run against.
 using BookTypes = ::testing::Types<MapOrderBook, FastOrderBook>;
 
-// Names typed-test instances "Map" and "Fast" instead of 0 and 1.
+// This names the typed-test instances "Map" and "Fast" instead of 0 and 1.
 struct BookTypeNames {
     template <class Book>
     static std::string GetName(int /*index*/) {  // NOLINT(readability-identifier-naming)
@@ -29,7 +29,7 @@ struct BookTypeNames {
     }
 };
 
-// ---- Expected-event builders --------------------------------------------------------
+// The helpers below build the events that a test expects to see.
 
 inline BookEvent accepted(const OrderRequest& r) {
     return OrderAccepted{.order_id = r.id,
@@ -41,7 +41,7 @@ inline BookEvent accepted(const OrderRequest& r) {
                          .price = r.type == OrderType::Market ? 0 : r.price,
                          .qty = r.qty};
 }
-// A plain limit GoodTillCancel order with no owner.
+// This overload is for a plain GoodTillCancel limit order with no owner.
 inline BookEvent accepted(OrderId id, Side side, Price price, Qty qty) {
     return accepted(OrderRequest{.id = id, .side = side, .price = price, .qty = qty});
 }

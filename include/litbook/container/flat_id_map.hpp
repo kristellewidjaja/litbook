@@ -11,20 +11,21 @@
 namespace litbook {
 
 // Hash map from a 64-bit key (an order ID) to a 32-bit value (a pool index), with a
-// capacity fixed at construction. Open addressing with linear probing in one flat
-// array: a lookup reads consecutive slots, usually just one cache line, and nothing is
-// allocated after the constructor (std::unordered_map allocates a node per insert).
+// capacity fixed at construction. It uses open addressing with linear probing in one flat
+// array, so a lookup reads consecutive slots, usually within one cache line. Nothing is
+// allocated after the constructor, unlike std::unordered_map, which allocates a node per
+// insert.
 //
-// - Table size is a power of two at least twice max_entries, so the load factor never
-//   exceeds 50% and probe sequences stay short.
-// - Hash: Fibonacci hashing (multiply by 2^64 / golden ratio, keep the top bits). It
-//   spreads sequential IDs, the common case, evenly. It is not hardened against
-//   adversarial keys; fine for exchange-assigned IDs.
-// - Erase uses backward-shift deletion instead of tombstones, so the table never fills
-//   up with dead slots under heavy churn.
+// The table size is a power of two at least twice max_entries, so the load factor never
+// exceeds 50% and probe sequences stay short.
+// The hash is Fibonacci hashing. We multiply the key by 2^64 / golden ratio and keep the
+// top bits. This spreads sequential IDs, the common case, evenly. It is not hardened
+// against adversarial keys, which is fine for exchange-assigned IDs.
+// Erase uses backward-shift deletion instead of tombstones (markers left in deleted
+// slots), so the table never fills up with dead slots under heavy churn.
 //
-// Invariants: size() <= max_entries(); every stored key is reachable from its home slot
-// without crossing an empty slot; no key is stored twice.
+// These invariants always hold. size() <= max_entries(). Every stored key is reachable
+// from its home slot without crossing an empty slot. No key is stored twice.
 class FlatIdMap {
 public:
     using Key = std::uint64_t;
@@ -42,8 +43,8 @@ public:
         shift_ = 64 - std::countr_zero(table);
     }
 
-    // Adds key -> value. Returns false (and changes nothing) if the key is already
-    // present or the map holds max_entries() keys. `value` must not be kNotFound.
+    // Stores `value` under `key`. Returns false and changes nothing if the key is already
+    // present or the map already holds max_entries() keys. `value` must not be kNotFound.
     bool insert(Key key, Value value) noexcept {
         if (size_ == max_entries_) {
             return false;
@@ -60,11 +61,11 @@ public:
         return true;
     }
 
-    // The value for `key`, or kNotFound.
+    // Returns the value for `key`, or kNotFound.
     [[nodiscard]] Value find(Key key) const noexcept {
         for (std::size_t i = home(key);; i = (i + 1) & mask_) {
             if (slots_[i].value == kNotFound) {
-                return kNotFound;  // an empty slot ends every probe sequence
+                return kNotFound;  // An empty slot ends every probe sequence.
             }
             if (slots_[i].key == key) {
                 return slots_[i].value;
@@ -83,13 +84,13 @@ public:
             }
             hole = (hole + 1) & mask_;
         }
-        // Backward shift: walk the run after the hole and pull back any entry whose probe
-        // path passes through the hole, so no later lookup stops early at it.
+        // Backward shift. Walk the run of entries after the hole and pull back any entry whose
+        // probe path passes through the hole, so no later lookup stops early there.
         for (std::size_t j = (hole + 1) & mask_; slots_[j].value != kNotFound;
              j = (j + 1) & mask_) {
             const std::size_t k = home(slots_[j].key);
-            // The entry at j may move to the hole iff the hole is on its path k..j, i.e.
-            // the hole is no further from j (going backwards) than its home is.
+            // The entry at j may move into the hole if and only if the hole lies on its path from
+            // k to j, which means the hole is no further back from j than its home slot k is.
             if (((j - hole) & mask_) <= ((j - k) & mask_)) {
                 slots_[hole] = slots_[j];
                 hole = j;
@@ -104,7 +105,7 @@ public:
     [[nodiscard]] std::size_t max_entries() const noexcept { return max_entries_; }
     [[nodiscard]] std::size_t table_size() const noexcept { return slots_.size(); }
 
-    // Checks the probe invariant for every stored key. O(table_size()); for tests.
+    // Checks the probe invariant for every stored key in O(table_size()) time. For tests.
     [[nodiscard]] bool check_invariants() const {
         std::size_t count = 0;
         for (std::size_t i = 0; i < slots_.size(); ++i) {
@@ -114,7 +115,7 @@ public:
             ++count;
             for (std::size_t p = home(slots_[i].key); p != i; p = (p + 1) & mask_) {
                 if (slots_[p].value == kNotFound || slots_[p].key == slots_[i].key) {
-                    return false;  // gap before reaching the key, or a duplicate
+                    return false;  // A gap before reaching the key, or a duplicate.
                 }
             }
         }
@@ -124,7 +125,7 @@ public:
 private:
     struct Slot {
         Key key = 0;
-        Value value = kNotFound;  // kNotFound marks an empty slot (any key value is legal)
+        Value value = kNotFound;  // kNotFound marks an empty slot, because any key value is legal.
     };
 
     [[nodiscard]] std::size_t home(Key key) const noexcept {

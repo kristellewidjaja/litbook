@@ -1,11 +1,10 @@
-# The differential fuzz target, shared by two executables:
-#   book_fuzzer          libFuzzer build (`fuzz` preset, Clang only)
-#   litbook_fuzz_replay  replays the saved inputs in seeds/ and regressions/ as a normal
-#                        test, in every other preset
+# Two executables share the differential fuzz target. book_fuzzer is the libFuzzer build
+# (`fuzz` preset, Clang only). litbook_fuzz_replay replays the saved inputs in seeds/ and
+# regressions/ as a normal test, in every other preset.
 add_library(litbook_fuzz_target STATIC book_fuzzer.cpp)
 target_include_directories(litbook_fuzz_target
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-    PRIVATE ${PROJECT_SOURCE_DIR}/tests)  # the naive oracle
+    PRIVATE ${PROJECT_SOURCE_DIR}/tests)  # for the naive oracle
 target_link_libraries(litbook_fuzz_target PUBLIC litbook::litbook PRIVATE litbook::warnings)
 
 if(LITBOOK_FUZZ)

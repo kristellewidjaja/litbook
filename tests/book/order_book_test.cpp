@@ -1,5 +1,6 @@
-// Phase 1 scenarios: limit orders, price-time priority, cancels. Typed tests: every
-// scenario runs against every book implementation (BookTypes).
+// These are the Phase 1 scenarios, covering limit orders, price-time priority and cancels.
+// They are typed tests, so every scenario runs against every book implementation
+// (BookTypes).
 
 #include "litbook/book/recording_listener.hpp"
 
@@ -20,7 +21,8 @@ using namespace testing;  // NOLINT(google-build-using-namespace): event builder
 constexpr Side kBuy = Side::Buy;
 constexpr Side kSell = Side::Sell;
 
-// Fixture: a book wired to a recorder. Every test ends by checking the invariants.
+// The test fixture is a book wired to a recorder. Every test ends by checking the
+// invariants.
 template <class Book>
 class OrderBookTest : public ::testing::Test {
 protected:
@@ -48,7 +50,7 @@ TYPED_TEST_SUITE(OrderBookTest, BookTypes, BookTypeNames);
 
 using Events = std::vector<BookEvent>;
 
-// ---- Empty book -------------------------------------------------------------
+// Tests for an empty book.
 
 TYPED_TEST(OrderBookTest, EmptyBookHasNoBestPrices) {
     EXPECT_EQ(this->book_.best_bid(), std::nullopt);
@@ -60,7 +62,7 @@ TYPED_TEST(OrderBookTest, EmptyBookHasNoBestPrices) {
     EXPECT_TRUE(this->book_.depth(kBuy, 10).empty());
 }
 
-// ---- Resting without trading ------------------------------------------------
+// Tests for orders that rest without trading.
 
 TYPED_TEST(OrderBookTest, BuyRestsWhenBookIsEmpty) {
     EXPECT_EQ(this->add(1, kBuy, 100, 10),
@@ -123,7 +125,7 @@ TYPED_TEST(OrderBookTest, DepthIsBestFirstAndRespectsMaxLevels) {
                                          {.price = 103, .total_qty = 4, .order_count = 1}}));
 }
 
-// ---- Matching ---------------------------------------------------------------
+// Tests for matching.
 
 TYPED_TEST(OrderBookTest, ExactCrossFillsBothCompletely) {
     this->add(1, kSell, 100, 10);
@@ -213,7 +215,7 @@ TYPED_TEST(OrderBookTest, SellSweepsBidsHighestFirst) {
     EXPECT_EQ(std::get<Trade>(events[5]).price, 98);
 }
 
-// ---- Time priority ----------------------------------------------------------
+// Tests for time priority.
 
 TYPED_TEST(OrderBookTest, OrdersAtOnePriceFillInArrivalOrder) {
     this->add(10, kSell, 100, 1);
@@ -254,7 +256,7 @@ TYPED_TEST(OrderBookTest, MatchIdsIncreaseAcrossCalls) {
     EXPECT_EQ(std::get<Trade>(b[1]).match_id, 3U);
 }
 
-// ---- Cancels ----------------------------------------------------------------
+// Tests for cancels.
 
 TYPED_TEST(OrderBookTest, CancelRemovesRestingOrder) {
     this->add(1, kBuy, 100, 10);
@@ -316,7 +318,7 @@ TYPED_TEST(OrderBookTest, CancelBestLevelExposesNextLevel) {
     EXPECT_EQ(this->book_.best_bid(), 99);
 }
 
-// ---- Rejects ----------------------------------------------------------------
+// Tests for rejects.
 
 TYPED_TEST(OrderBookTest, ZeroQuantityIsRejected) {
     EXPECT_EQ(this->add(1, kBuy, 100, 0),
@@ -333,14 +335,15 @@ TYPED_TEST(OrderBookTest, DuplicateRestingIdIsRejectedAndBookUnchanged) {
 }
 
 TYPED_TEST(OrderBookTest, IdOfFilledOrderMayBeReused) {
-    // Documented behavior: the book only guarantees uniqueness among *resting* orders.
+    // This is documented behavior. The book only guarantees uniqueness among *resting*
+    // orders.
     // Session-level uniqueness is the gateway's job (Phase 6).
     this->add(1, kSell, 100, 5);
     this->add(2, kBuy, 100, 5);
     EXPECT_EQ(this->add(1, kBuy, 99, 1), (Events{accepted(1, kBuy, 99, 1), level(kBuy, 99, 1, 1)}));
 }
 
-// ---- Numeric edges ----------------------------------------------------------
+// Tests for numeric edge cases.
 
 TYPED_TEST(OrderBookTest, NegativePricesWork) {
     this->add(1, kBuy, -5, 1);

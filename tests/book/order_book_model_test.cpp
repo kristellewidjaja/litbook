@@ -1,6 +1,6 @@
-// Model-based test: random operations go to the naive oracle (naive_book.hpp),
-// MapOrderBook and FastOrderBook. All three must emit identical event streams and
-// agree on every query; both real books' invariants must hold after every operation.
+// This is a model-based test. Random operations go to the naive oracle (naive_book.hpp),
+// MapOrderBook and FastOrderBook. All three must emit identical event streams and agree on
+// every query, and the invariants of both real books must hold after every operation.
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/fast_order_book.hpp"
@@ -23,13 +23,14 @@ namespace {
 
 using testing::WorkloadParams;
 
-// Counts what a workload actually exercised, so a generator change that silently stops
-// producing (say) self-trades makes the test fail instead of passing vacuously.
+// Counts what a workload actually exercised. That way a generator change that silently
+// stops producing self-trades (for example) makes the test fail, instead of letting it pass
+// without really testing anything.
 struct Coverage {
     int trades = 0;
     int resting_adds = 0;
     int user_cancels = 0;
-    int unfilled_cancels = 0;  // IOC / FOK / market remainders
+    int unfilled_cancels = 0;  // remainders of IOC, FOK and market orders
     int stp_cancels = 0;
     int stp_partial = 0;  // Decrement policy leaving quantity behind
     int book_full = 0;

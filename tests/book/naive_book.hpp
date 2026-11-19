@@ -1,11 +1,11 @@
 #pragma once
 
-// Test oracle: an intentionally naive order book that shares no code or data
-// structures with MapOrderBook. One flat vector of orders, linear scans for
-// everything. Slow (O(n) per step) but small enough to verify by reading, rule by rule,
-// against the contract in events.hpp.
+// This is the test oracle, an order book that is naive on purpose. It shares no code or
+// data structures with MapOrderBook. It keeps one flat vector of orders and uses linear
+// scans for everything. It is slow (O(n) per step) but small enough to verify by reading,
+// rule by rule, against the contract in events.hpp.
 //
-// Invariant: produces the same event stream as any correct book.
+// Its invariant is that it produces the same event stream as any correct book.
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/events.hpp"
@@ -26,7 +26,7 @@ public:
         : listener_(&listener), config_(config) {}
 
     void submit(const OrderRequest& r) {
-        // Validation, in the documented order.
+        // Validate the request, checking in the documented order.
         std::optional<RejectReason> reject;
         if (r.qty == 0) {
             reject = RejectReason::ZeroQuantity;
@@ -167,7 +167,7 @@ private:
         Price price;
         Qty left;
         bool post_only;
-        std::uint64_t seq;  // arrival order; smaller = earlier
+        std::uint64_t seq;  // arrival order, where smaller means earlier
     };
 
     struct Incoming {
@@ -198,7 +198,8 @@ private:
         std::erase_if(orders_, [id](const Order& o) { return o.id == id; });
     }
 
-    // Price priority, then time priority, between two resting orders on the same side.
+    // Compares two resting orders on the same side by price priority, then by time
+    // priority.
     static bool better(const Order& a, const Order& b) {
         if (a.price != b.price) {
             return a.side == Side::Sell ? a.price < b.price : a.price > b.price;
@@ -210,8 +211,8 @@ private:
         return market || (side == Side::Buy ? resting.price <= price : resting.price >= price);
     }
 
-    // Highest-priority resting order an incoming order on `side` at `price` would reach
-    // (any price if `market`), or nullptr.
+    // Returns the highest-priority resting order that an incoming order on `side` at `price`
+    // would reach (at any price if `market` is set), or nullptr if there is none.
     Order* first_crossing(Side side, Price price, bool market) {
         // NOLINTNEXTLINE(misc-const-correctness): returned as a mutable pointer below
         Order* best_order = nullptr;

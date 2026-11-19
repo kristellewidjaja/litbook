@@ -1,6 +1,7 @@
 #pragma once
 
-// Test limits shared by tests, fuzz targets and benchmarks. No GoogleTest dependency.
+// These test limits are shared by tests, fuzz targets and benchmarks. This file has no
+// GoogleTest dependency.
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/types.hpp"

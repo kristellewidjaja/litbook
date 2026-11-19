@@ -1,18 +1,17 @@
-// First benchmarks of both order books: two per-operation microbenchmarks and three
-// mixed operation streams. Every benchmark runs the same code against MapOrderBook and
-// FastOrderBook with the same config, so the pairs are directly comparable.
+// These are the first benchmarks of both order books, with two per-operation
+// microbenchmarks and three mixed operation streams. Every benchmark runs the same code
+// against MapOrderBook and FastOrderBook with the same config, so the pairs are directly
+// comparable.
 //
-// Method:
-//   - The listener only counts events (a virtual call per event, as in real use);
-//     recording events into a vector would measure the recorder, not the book.
-//   - Operation streams are generated before timing starts.
-//   - Books are built and destroyed outside the timed region (construction is startup
-//     cost, not hot-path cost).
-//   - Microbenchmarks leave the book in the state they found it, so every iteration
-//     does the same work against a 2,000-order background book.
-//   - `time/op` is time per book operation (submit, cancel or modify).
+// The listener only counts events (a virtual call per event, as in real use). Recording
+// events into a vector would measure the recorder, not the book. Operation streams are
+// generated before timing starts. Books are built and destroyed outside the timed region,
+// because construction is startup cost, not hot-path cost. Microbenchmarks leave the book
+// in the state they found it, so every iteration does the same work against a
+// 2,000-order background book. The `time/op` counter is time per book operation (submit,
+// cancel or modify).
 //
-// Run with the release preset only; see docs/BENCHMARKS.md for the logged results.
+// Run with the release preset only. The logged results are in docs/BENCHMARKS.md.
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/events.hpp"
@@ -50,7 +49,7 @@ private:
 };
 
 constexpr Price kMid = 10'000;
-constexpr int kBackgroundLevels = 100;  // per side
+constexpr int kBackgroundLevels = 100;  // levels on each side
 constexpr int kOrdersPerLevel = 10;
 constexpr OrderId kFirstBenchId = 1'000'000;
 constexpr BookConfig kConfig{
@@ -70,7 +69,8 @@ void fill_background(Book& book) {
 }
 
 void set_time_per_op(benchmark::State& state, double ops_per_iteration) {
-    // Inverted rate = seconds per operation; printed with an SI prefix, e.g. "25.2ns".
+    // An inverted rate gives seconds per operation, printed with an SI prefix such as
+    // "25.2ns".
     state.counters["time/op"] =
         benchmark::Counter(ops_per_iteration, benchmark::Counter::kIsIterationInvariantRate |
                                                   benchmark::Counter::kInvert);
@@ -114,8 +114,8 @@ void BM_RestThenCancel_NewLevel(benchmark::State& state) {
     set_time_per_op(state, 2);
 }
 
-// A sell rests at kMid (a new best ask), then a buy at kMid fills it completely:
-// one trade, the level is emptied, and the best ask moves back to kMid+1.
+// A sell rests at kMid (a new best ask), then a buy at kMid fills it completely.
+// That makes one trade, empties the level, and moves the best ask back to kMid+1.
 template <class Book>
 void BM_RestThenMatch(benchmark::State& state) {
     CountingListener listener;
@@ -153,7 +153,7 @@ void BM_Stream(benchmark::State& state, const testing::WorkloadParams& p) {
     set_time_per_op(state, static_cast<double>(ops.size()));
 }
 
-// The workload config's band and capacity are ignored: every benchmark uses kConfig.
+// The workload config's band and capacity are ignored, because every benchmark uses kConfig.
 const testing::WorkloadParams kBalanced{.name = "Balanced",
                                         .seed = 101,
                                         .operations = 100'000,

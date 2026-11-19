@@ -4,14 +4,15 @@
 
 namespace litbook {
 
-// A request to enter a new order. Plain data: validation happens in the book, which
-// rejects invalid requests with a reason (see RejectReason).
+// A request to enter a new order. It is plain data. The book does the validation and
+// rejects an invalid request with a reason (see RejectReason).
 //
-// Valid combinations:
-//   - qty >= 1 and a multiple of the book's lot size
-//   - Limit orders: price is a multiple of the book's tick size
-//   - Market orders: price is ignored; GoodTillCancel behaves like ImmediateOrCancel
-//   - post_only requires type == Limit and tif == GoodTillCancel
+// A request is valid only if all of these rules hold.
+//   1. qty is at least 1 and a multiple of the book's lot size.
+//   2. For a limit order, price is a multiple of the book's tick size.
+//   3. For a market order, price is ignored, and GoodTillCancel behaves like
+//      ImmediateOrCancel.
+//   4. post_only requires type == Limit and tif == GoodTillCancel.
 struct OrderRequest {
     OrderId id = 0;
     OwnerId owner = kNoOwner;

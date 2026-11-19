@@ -1,4 +1,4 @@
-// libFuzzer entry point (built only with the `fuzz` preset).
+// This is the libFuzzer entry point. It is built only with the `fuzz` preset.
 
 #include <cstddef>
 #include <cstdint>

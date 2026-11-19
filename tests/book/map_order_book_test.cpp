@@ -1,4 +1,4 @@
-// Tests specific to MapOrderBook. The shared behavior is covered for every book by
+// These tests are specific to MapOrderBook. The shared behavior is covered for every book by
 // order_book_test.cpp and order_book_rules_test.cpp.
 
 #include "litbook/book/map_order_book.hpp"

@@ -19,7 +19,7 @@ constexpr bool crosses(Side aggressor_side, Price limit, Price level_price) noex
     return aggressor_side == Side::Buy ? level_price <= limit : level_price >= limit;
 }
 
-// Limit that crosses every possible price: how a market order matches.
+// A limit that crosses every possible price. This is how a market order matches.
 constexpr Price market_limit(Side side) noexcept {
     return side == Side::Buy ? std::numeric_limits<Price>::max()
                              : std::numeric_limits<Price>::min();
@@ -46,10 +46,10 @@ decltype(auto) MapOrderBook::with_levels(Side side, F&& f) const {
     return side == Side::Buy ? std::forward<F>(f)(bids_) : std::forward<F>(f)(asks_);
 }
 
-// ---- Validation ---------------------------------------------------------------
+// Validation.
 
 bool MapOrderBook::valid_price(Price price) const noexcept {
-    return price % config_.tick_size == 0;  // also correct for negative prices
+    return price % config_.tick_size == 0;  // This is also correct for negative prices.
 }
 
 bool MapOrderBook::in_band(Price price) const noexcept {
@@ -94,9 +94,9 @@ std::optional<RejectReason> MapOrderBook::validate(const OrderRequest& request) 
     return std::nullopt;
 }
 
-// FOK rule: walk the resting orders this aggressor would reach, in priority order.
-// It can fill only if enough quantity is reached *before* any same-owner order, so a
-// FOK never partially executes and never triggers self-trade prevention.
+// To apply the FOK rule, walk the resting orders this aggressor would reach, in priority
+// order. It can fill only if enough quantity is reached *before* any same-owner order, so
+// a FOK order never partially executes and never triggers self-trade prevention.
 bool MapOrderBook::can_fill_completely(const Aggressor& aggressor) const {
     return with_levels(opposite(aggressor.side), [&](const auto& levels) {
         AggregateQty reachable = 0;
@@ -118,7 +118,7 @@ bool MapOrderBook::can_fill_completely(const Aggressor& aggressor) const {
     });
 }
 
-// ---- Public operations ----------------------------------------------------------
+// Public operations.
 
 void MapOrderBook::submit(const OrderRequest& request) {
     if (const auto reason = validate(request)) {
@@ -215,7 +215,7 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
         return reject(RejectReason::InvalidLotSize);
     }
     const Location location = found->second;
-    const RestingOrder order = *location.order;  // copy: the list node may be erased below
+    const RestingOrder order = *location.order;  // A copy, since the node may be erased below.
     if (order.post_only && would_cross(location.side, new_price)) {
         return reject(RejectReason::PostOnlyWouldCross);
     }
@@ -227,11 +227,11 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
         Level& level = level_it->second;
 
         if (keeps_priority) {
-            // Same price, not larger: shrink in place and keep queue position.
+            // Same price and not larger, so shrink it in place and keep its queue position.
             level.total_qty -= order.remaining - new_qty;
             location.order->remaining = new_qty;
         } else {
-            // Take it out (it loses its place); it is re-entered below at the new terms.
+            // Take it out, so it loses its place. It is re-entered below at the new terms.
             level.total_qty -= order.remaining;
             level.orders.erase(location.order);
             index_.erase(found);
@@ -250,7 +250,7 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     if (keeps_priority) {
         return;
     }
-    // The order left the book above, so its slot is free: re-resting cannot exceed
+    // The order left the book above, so its slot is free. Re-resting cannot exceed
     // max_orders and needs no capacity check.
     Aggressor aggressor{.id = id,
                         .owner = order.owner,
@@ -263,7 +263,7 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
     }
 }
 
-// ---- Matching -------------------------------------------------------------------
+// Matching.
 
 void MapOrderBook::match(Aggressor& aggressor) {
     if (aggressor.side == Side::Buy) {
@@ -278,7 +278,7 @@ void MapOrderBook::match_against(Levels& levels, Aggressor& aggressor) {
     const Side resting_side = opposite(aggressor.side);
 
     while (aggressor.remaining > 0 && !levels.empty()) {
-        const auto level_it = levels.begin();  // best opposite price
+        const auto level_it = levels.begin();  // The best opposite price.
         const Price level_price = level_it->first;
         if (!crosses(aggressor.side, aggressor.limit, level_price)) {
             break;
@@ -286,7 +286,7 @@ void MapOrderBook::match_against(Levels& levels, Aggressor& aggressor) {
 
         Level& level = level_it->second;
         while (aggressor.remaining > 0 && !level.orders.empty()) {
-            RestingOrder& resting = level.orders.front();  // highest priority at this price
+            RestingOrder& resting = level.orders.front();  // Highest priority at this price.
             if (is_self_trade(aggressor.owner, resting.owner)) {
                 prevent_self_trade(level, resting_side, level_price, aggressor);
                 continue;
@@ -397,7 +397,7 @@ void MapOrderBook::emit_level_update(Side side, Price price, const Level& level)
                                 .order_count = static_cast<std::uint32_t>(level.orders.size())});
 }
 
-// ---- Queries ----------------------------------------------------------------------
+// Queries.
 
 std::optional<Price> MapOrderBook::best_bid() const noexcept {
     if (bids_.empty()) {
@@ -443,29 +443,29 @@ std::size_t MapOrderBook::level_count(Side side) const noexcept {
     return side == Side::Buy ? bids_.size() : asks_.size();
 }
 
-// ---- Invariants -------------------------------------------------------------------
+// Invariant checks.
 
 template <class Levels>
 bool MapOrderBook::check_side(const Levels& levels, Side side, std::size_t& orders_seen) const {
     for (const auto& [price, level] : levels) {
         if (level.orders.empty() || !valid_price(price) || !in_band(price)) {
-            return false;  // invariants 2, 7
+            return false;  // Breaks invariant 2 or 7.
         }
         AggregateQty sum = 0;
         for (auto it = level.orders.begin(); it != level.orders.end(); ++it) {
             if (it->remaining == 0 || !valid_qty(it->remaining)) {
-                return false;  // invariants 3, 7
+                return false;  // Breaks invariant 3 or 7.
             }
             sum += it->remaining;
             const auto found = index_.find(it->id);
             if (found == index_.end() || found->second.side != side ||
                 found->second.price != price || found->second.order != it) {
-                return false;  // invariant 6
+                return false;  // Breaks invariant 6.
             }
             ++orders_seen;
         }
         if (sum != level.total_qty) {
-            return false;  // invariant 4
+            return false;  // Breaks invariant 4.
         }
     }
     return true;
@@ -473,16 +473,16 @@ bool MapOrderBook::check_side(const Levels& levels, Side side, std::size_t& orde
 
 bool MapOrderBook::check_invariants() const {
     if (!bids_.empty() && !asks_.empty() && bids_.begin()->first >= asks_.begin()->first) {
-        return false;  // invariant 1
+        return false;  // Breaks invariant 1.
     }
     std::size_t orders_seen = 0;
     if (!check_side(bids_, Side::Buy, orders_seen) || !check_side(asks_, Side::Sell, orders_seen)) {
         return false;
     }
-    // Invariant 6, other direction: no index entries for orders that are not in the book.
-    // (Invariant 5, priority order, is enforced structurally by push_back-only insertion
-    // and is tested behaviorally.)
-    return orders_seen == index_.size() && index_.size() <= config_.max_orders;  // 6, 8
+    // This checks invariant 6 in the other direction, so no index entry exists for an order
+    // that is not in the book. Invariant 5 (priority order) holds by construction, because
+    // orders are only added with push_back, and it is tested behaviorally.
+    return orders_seen == index_.size() && index_.size() <= config_.max_orders;  // Invariants 6, 8.
 }
 
 }  // namespace litbook

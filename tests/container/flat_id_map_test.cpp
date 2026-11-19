@@ -24,7 +24,7 @@ TEST(FlatIdMapTest, EmptyMapFindsNothing) {
 }
 
 TEST(FlatIdMapTest, TableIsAPowerOfTwoAtLeastTwiceCapacity) {
-    EXPECT_EQ(FlatIdMap(1).table_size(), 16U);  // minimum
+    EXPECT_EQ(FlatIdMap(1).table_size(), 16U);  // the minimum table size
     EXPECT_EQ(FlatIdMap(8).table_size(), 16U);
     EXPECT_EQ(FlatIdMap(9).table_size(), 32U);
     EXPECT_EQ(FlatIdMap(1000).table_size(), 2048U);
@@ -64,7 +64,7 @@ TEST(FlatIdMapTest, InsertBeyondMaxEntriesIsRefused) {
     EXPECT_TRUE(map.insert(3, 3));
     EXPECT_FALSE(map.insert(4, 4));
     EXPECT_TRUE(map.erase(2));
-    EXPECT_TRUE(map.insert(4, 4));  // room again after an erase
+    EXPECT_TRUE(map.insert(4, 4));  // an erase makes room again
 }
 
 TEST(FlatIdMapTest, ExtremeKeysWork) {

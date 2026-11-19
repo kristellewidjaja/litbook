@@ -7,8 +7,8 @@ project(litbook
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)          # -std=c++20, not -std=gnu++20
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # for clangd and clang-tidy
+set(CMAKE_CXX_EXTENSIONS OFF)          # use -std=c++20, not -std=gnu++20
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # used by clangd and clang-tidy
 
 option(LITBOOK_BUILD_TESTS "Build unit tests" ON)
 option(LITBOOK_BUILD_BENCH "Build benchmarks" ON)
@@ -19,7 +19,7 @@ include(Fuzzing)
 include(Warnings)
 include(Dependencies)
 
-# ---- Core library -----------------------------------------------------------
+# Core library
 add_library(litbook STATIC
     src/version.cpp
     src/book/book_config.cpp
@@ -30,7 +30,7 @@ add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(litbook PRIVATE litbook::warnings)
 
-# ---- Tests and benchmarks ---------------------------------------------------
+# Tests and benchmarks
 if(LITBOOK_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -44,8 +44,8 @@ if(LITBOOK_BUILD_TESTS OR LITBOOK_FUZZ)
     add_subdirectory(fuzz)
 endif()
 
-# Optional local practice exercises (not part of the repository). Their tests carry
-# the label "exercise" and are excluded from the normal test presets.
+# These are optional local practice exercises, not part of the repository. Their tests
+# carry the label "exercise" and are excluded from the normal test presets.
 if(LITBOOK_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/exercises/CMakeLists.txt)
     add_subdirectory(exercises)
 endif()

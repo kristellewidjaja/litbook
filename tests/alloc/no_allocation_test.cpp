@@ -26,7 +26,8 @@
 
 namespace {
 
-// Plain globals: these tests are single-threaded, and the hook must not allocate.
+// These are plain globals because the tests are single-threaded and the hook must not
+// allocate.
 bool g_armed = false;
 std::uint64_t g_allocations = 0;
 
@@ -122,7 +123,7 @@ public:
     [[nodiscard]] std::uint64_t count() const noexcept { return g_allocations; }
 };
 
-// Listener that does not allocate: just counts.
+// This listener only counts events, so it does not allocate.
 class CountingListener final : public OrderBookListener {
 public:
     void on_accepted(const OrderAccepted& /*event*/) override { ++events; }
@@ -153,8 +154,8 @@ TEST(NoAllocationTest, TheCounterSeesAllocations) {
     EXPECT_GE(count, 1U);
 }
 
-// Positive control: the reference book allocates (map nodes, list nodes, hash nodes),
-// so a zero for the fast book below means something.
+// This is a positive control. The reference book allocates (map nodes, list nodes, hash
+// nodes), so a zero for the fast book below means something.
 TEST(NoAllocationTest, MapOrderBookAllocates) {
     const auto params = testing::standard_workloads().front();
     const auto ops = testing::generate(params);
@@ -186,7 +187,7 @@ TEST(NoAllocationTest, FastOrderBookNeverAllocatesAfterConstruction) {
             count = counter.count();
         }
         EXPECT_EQ(count, 0U) << params.name;
-        EXPECT_GT(listener.trades, 0U) << params.name;  // the book really did work
+        EXPECT_GT(listener.trades, 0U) << params.name;  // proves the book really did work
         EXPECT_TRUE(book.check_invariants()) << params.name;
         total_operations += ops.size();
     }

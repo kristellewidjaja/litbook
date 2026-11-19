@@ -1,6 +1,6 @@
-// Phase 2 rules: market / IOC / FOK / post-only, modify, self-trade prevention,
-// tick and lot validation, price band and capacity. Each test asserts the exact event
-// stream, for every book implementation (BookTypes).
+// These tests cover the Phase 2 rules. That means market, IOC, FOK and post-only orders,
+// modify, self-trade prevention, tick and lot validation, and the price band and capacity.
+// Each test asserts the exact event stream, for every book implementation (BookTypes).
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/order_request.hpp"
@@ -27,7 +27,8 @@ using Events = std::vector<BookEvent>;
 template <class Book>
 class RulesTest : public ::testing::Test {
 protected:
-    // Unset band / capacity fields get the shared test limits (book_test_support.hpp).
+    // Band and capacity fields left unset get the shared test limits
+    // (book_test_support.hpp).
     void use_config(BookConfig config) { book_ = Book(rec_, with_test_limits(config)); }
 
     void TearDown() override { EXPECT_TRUE(book_.check_invariants()); }
@@ -38,7 +39,7 @@ protected:
         EXPECT_TRUE(book_.check_invariants());
         return rec_.take();
     }
-    // Plain resting limit order, no owner.
+    // Submits a plain resting limit order, with no owner by default.
     Events limit(OrderId id, Side side, Price price, Qty qty, OwnerId owner = kNoOwner) {
         return submit({.id = id, .owner = owner, .side = side, .price = price, .qty = qty});
     }
@@ -55,7 +56,7 @@ protected:
 
 TYPED_TEST_SUITE(RulesTest, BookTypes, BookTypeNames);
 
-// ---- Configuration and validation ---------------------------------------------
+// Tests for configuration and validation.
 
 TYPED_TEST(RulesTest, PriceOffTickIsRejected) {
     this->use_config({.tick_size = 5});
@@ -88,7 +89,7 @@ TYPED_TEST(RulesTest, ContradictoryOrderTypesAreRejected) {
               (Events{rejected(3, RejectReason::InvalidOrderType)}));
 }
 
-// ---- Market orders ----------------------------------------------------------
+// Tests for market orders.
 
 TYPED_TEST(RulesTest, MarketOrderSweepsEveryLevelRegardlessOfPrice) {
     this->limit(1, kSell, 100, 2);
@@ -123,7 +124,7 @@ TYPED_TEST(RulesTest, MarketOrderIgnoresPriceAndTick) {
     EXPECT_EQ(std::get<OrderAccepted>(events[0]).price, 0);
 }
 
-// ---- IOC ------------------------------------------------------------------------
+// Tests for IOC (immediate-or-cancel) orders.
 
 TYPED_TEST(RulesTest, IocFillsWhatItCanAndCancelsTheRest) {
     this->limit(1, kSell, 100, 4);
@@ -149,7 +150,7 @@ TYPED_TEST(RulesTest, FullyFilledIocHasNoCancel) {
               (Events{accepted(r), trade(1, 2, 1, kBuy, 100, 5, 0, 0), level(kSell, 100, 0, 0)}));
 }
 
-// ---- FOK ------------------------------------------------------------------------
+// Tests for FOK (fill-or-kill) orders.
 
 TYPED_TEST(RulesTest, FokFillsAcrossLevelsWhenEnoughIsAvailable) {
     this->limit(1, kSell, 100, 3);
@@ -198,7 +199,7 @@ TYPED_TEST(RulesTest, MarketFokUsesWholeBook) {
     EXPECT_EQ(this->submit(r).size(), 5U);  // accepted + 2 x (trade, level)
 }
 
-// ---- Post-only ------------------------------------------------------------------
+// Tests for post-only orders.
 
 TYPED_TEST(RulesTest, PostOnlyRestsWhenItDoesNotCross) {
     this->limit(1, kSell, 101, 5);
@@ -222,7 +223,7 @@ TYPED_TEST(RulesTest, PostOnlyChecksEvenAgainstOwnOrders) {
               (Events{rejected(2, RejectReason::PostOnlyWouldCross)}));
 }
 
-// ---- Modify -------------------------------------------------------------------
+// Tests for modify.
 
 TYPED_TEST(RulesTest, QuantityDecreaseKeepsQueuePriority) {
     this->limit(1, kSell, 100, 10);
@@ -308,7 +309,7 @@ TYPED_TEST(RulesTest, ModifyOfFilledOrderIsUnknown) {
               (Events{ModifyRejected{.order_id = 1, .reason = RejectReason::UnknownOrderId}}));
 }
 
-// ---- Self-trade prevention ---------------------------------------------------
+// Tests for self-trade prevention.
 
 TYPED_TEST(RulesTest, DifferentOwnersTradeNormally) {
     this->limit(1, kSell, 100, 5, /*owner=*/7);
@@ -403,7 +404,7 @@ TYPED_TEST(RulesTest, StpAppliesToModifyReentry) {
                       canceled(2, 5, 0, CancelReason::SelfTradePrevention)}));
 }
 
-// ---- Price band -----------------------------------------------------------------
+// Tests for the price band.
 
 TYPED_TEST(RulesTest, PriceOutsideTheBandIsRejected) {
     this->use_config({.min_price = 90, .max_price = 110});
@@ -422,7 +423,8 @@ TYPED_TEST(RulesTest, BandEdgesAreInsideTheBand) {
 
 TYPED_TEST(RulesTest, BandIsCheckedAfterTickAndBeforeLot) {
     this->use_config({.tick_size = 5, .lot_size = 10, .min_price = 90, .max_price = 110});
-    // Off tick and out of band: the tick is reported. Out of band and odd lot: the band.
+    // When an order is off tick and out of band, the tick is reported. When it is out of
+    // band and an odd lot, the band is reported.
     EXPECT_EQ(this->limit(1, kBuy, 3, 10), (Events{rejected(1, RejectReason::InvalidPrice)}));
     EXPECT_EQ(this->limit(2, kBuy, 200, 7), (Events{rejected(2, RejectReason::PriceOutOfRange)}));
 }
@@ -444,7 +446,7 @@ TYPED_TEST(RulesTest, ModifyOutsideTheBandIsRejected) {
     EXPECT_EQ(this->book_.volume_at(kBuy, 100), 5U);
 }
 
-// ---- Capacity (max_orders) ----------------------------------------------------------
+// Tests for capacity (max_orders).
 
 TYPED_TEST(RulesTest, OrderThatWouldRestInAFullBookIsCanceledBookFull) {
     this->use_config({.max_orders = 2});
@@ -473,7 +475,7 @@ TYPED_TEST(RulesTest, AnOrderThatTradedAlwaysHasRoomToRest) {
     this->use_config({.max_orders = 2});
     this->limit(1, kSell, 101, 5);
     this->limit(2, kSell, 102, 5);
-    // Filled completely by part of order 1: nothing needs to rest.
+    // This order is filled completely by part of order 1, so nothing needs to rest.
     const OrderRequest r{.id = 3, .side = kBuy, .price = 101, .qty = 4};
     const Events events = this->submit(r);
     EXPECT_EQ(events,
@@ -504,7 +506,7 @@ TYPED_TEST(RulesTest, ModifyInAFullBookNeverRunsOutOfRoom) {
     this->use_config({.max_orders = 2});
     this->limit(1, kBuy, 100, 5);
     this->limit(2, kBuy, 99, 5);
-    // Losing priority takes the order out and puts it back: it reuses its own slot.
+    // Losing priority takes the order out and puts it back, so it reuses its own slot.
     EXPECT_EQ(this->modify(1, 98, 6), (Events{modified(1, kBuy, 98, 6, false),
                                               level(kBuy, 100, 0, 0), level(kBuy, 98, 6, 1)}));
     EXPECT_EQ(this->book_.order_count(), 2U);

@@ -1,7 +1,7 @@
 // Replays saved fuzz inputs without libFuzzer, so every build (any compiler, any
-// sanitizer) checks them. Arguments are files or directories; each file is one input.
-// A disagreement aborts inside run_one, which fails the test. `.md` files (notes) are
-// skipped.
+// sanitizer) checks them. The arguments are files or directories, and each file is one
+// input. A disagreement aborts inside run_one, which fails the test. Files ending in `.md`
+// are notes and are skipped.
 
 #include <cstdint>
 #include <cstdio>

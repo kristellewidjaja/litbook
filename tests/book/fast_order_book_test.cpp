@@ -1,6 +1,6 @@
-// Tests specific to FastOrderBook: construction limits, ladder edges, best-price
-// tracking across empty levels, and pool reuse. Shared behavior is covered for every
-// book by order_book_test.cpp and order_book_rules_test.cpp.
+// These tests are specific to FastOrderBook. They cover construction limits, ladder edges,
+// best-price tracking across empty levels, and pool reuse. The behavior shared by every book
+// is covered by order_book_test.cpp and order_book_rules_test.cpp.
 
 #include "litbook/book/fast_order_book.hpp"
 
@@ -28,14 +28,15 @@ constexpr BookConfig kSmall{.min_price = 0, .max_price = 1'000, .max_orders = 16
 TEST(FastOrderBookTest, InvalidConfigThrowsAtConstruction) {
     RecordingListener rec;
     const auto make = [&](BookConfig c) { return FastOrderBook(rec, c); };
-    // The shared rules.
+    // First come the rules that every book shares.
     EXPECT_THROW(make({.tick_size = 0, .min_price = 0, .max_price = 10, .max_orders = 1}),
                  std::invalid_argument);
     EXPECT_THROW(make({.lot_size = 0, .min_price = 0, .max_price = 10, .max_orders = 1}),
                  std::invalid_argument);
     EXPECT_THROW(make({.min_price = 10, .max_price = 9, .max_orders = 1}), std::invalid_argument);
     EXPECT_THROW(make({.min_price = 0, .max_price = 10, .max_orders = 0}), std::invalid_argument);
-    // FastOrderBook's own: a finite, on-tick, not too wide band and a bounded pool.
+    // Then come FastOrderBook's own rules. The band must be finite, on tick and not too
+    // wide, and the pool must be bounded.
     EXPECT_THROW(make({}), std::invalid_argument);  // the default band is unbounded
     EXPECT_THROW(make({.tick_size = 5, .min_price = 3, .max_price = 100, .max_orders = 1}),
                  std::invalid_argument);
@@ -107,7 +108,7 @@ TEST(FastOrderBookTest, BandAtTheInt64Extremes) {
     const auto events = rec.take();
     ASSERT_EQ(events.size(), 3U);
     EXPECT_EQ(std::get<Trade>(events[1]).price, kTop);
-    EXPECT_EQ(high.volume_at(kBuy, kInt64Max), 0U);  // off tick: no level, no crash
+    EXPECT_EQ(high.volume_at(kBuy, kInt64Max), 0U);  // off tick, so no level and no crash
     EXPECT_TRUE(high.check_invariants());
 }
 
@@ -139,7 +140,8 @@ TEST(FastOrderBookTest, VolumeAtOutsideTheBandOrOffTickIsZero) {
     EXPECT_EQ(book.volume_at(kBuy, kInt64Min), 0U);
 }
 
-// Many times the pool's capacity of orders come and go: slots are recycled correctly.
+// Many times the pool's capacity of orders come and go, and the slots must be recycled
+// correctly.
 TEST(FastOrderBookTest, PoolSlotsAreRecycledUnderChurn) {
     RecordingListener rec;
     FastOrderBook book(rec, {.min_price = 0, .max_price = 100, .max_orders = 4});
@@ -157,7 +159,7 @@ TEST(FastOrderBookTest, PoolSlotsAreRecycledUnderChurn) {
     }
     rec.clear();
     book.cancel(1);
-    EXPECT_EQ(rec.take().size(), 1U);  // long gone: CancelRejected
+    EXPECT_EQ(rec.take().size(), 1U);  // long gone, so CancelRejected
 }
 
 TEST(FastOrderBookTest, MoveAssignmentGivesAFreshBook) {

@@ -1,9 +1,10 @@
-// Long differential test: FastOrderBook against MapOrderBook (the trusted reference)
-// on long random streams, without the slow naive oracle. Every operation's events must
-// match exactly; invariants are checked periodically.
+// This is a long differential test. It runs FastOrderBook against MapOrderBook (the trusted
+// reference) on long random streams, without the slow naive oracle. The events from every
+// operation must match exactly, and the invariants are checked periodically.
 //
-// Operations per workload default to 100,000 (all 15 workloads: 1.5 million). Set
-// LITBOOK_DIFF_OPS for longer runs, e.g. LITBOOK_DIFF_OPS=5000000 ctest --preset release.
+// Each workload runs 100,000 operations by default, which is 1.5 million across all 15
+// workloads. Set LITBOOK_DIFF_OPS for longer runs, for example
+// LITBOOK_DIFF_OPS=5000000 ctest --preset release.
 
 #include "litbook/book/fast_order_book.hpp"
 #include "litbook/book/map_order_book.hpp"

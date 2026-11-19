@@ -1,6 +1,6 @@
 ---
-# Benchmarks: `for (auto _ : state)` is the Google Benchmark idiom; the analyzer
-# flags the unused loop variable as a dead store.
+# Google Benchmark loops are written `for (auto _ : state)`. The analyzer sees the unused
+# loop variable as a dead store, so that check is turned off for the benchmarks.
 InheritParentConfig: true
 Checks: '-clang-analyzer-deadcode.DeadStores'
 ...
