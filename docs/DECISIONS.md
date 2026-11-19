@@ -73,3 +73,30 @@ Verified 2026-11-18: ASan (heap-buffer-overflow), UBSan (signed overflow) and TS
 **Context:** D-002 set up docs for state, plan, rationale and measurements.
 **Choice:** The roadmap, progress notes and study notes are kept locally and gitignored. Only this decisions log and the benchmark log are published.
 **Reason:** The repository should present the engineering record (why things were built this way, and measured results), not personal to-do lists.
+
+## D-013 (2026-11-18): Core numeric types
+**Choice:** `Price = int64_t` (ticks), `Qty = uint32_t`, `AggregateQty = uint64_t` for sums, `OrderId = MatchId = uint64_t`. Plain type aliases.
+**Options rejected:** a single 64-bit quantity type (bigger order objects for no benefit, since OUCH and ITCH carry 4-byte share counts); strong wrapper types such as `struct Price { int64_t v; }` (they prevent mixing a price with a quantity, but add a lot of boilerplate at this stage; `-Wconversion`/`-Wsign-conversion` catch the most dangerous mixes).
+**Reason:** Order quantity matches the wire protocols. Totals over many orders cannot overflow (a test rests four `UINT32_MAX` orders at one price).
+
+## D-014 (2026-11-18): Reference book from standard containers
+**Choice:** `std::map<Price, Level>` per side (bids with `std::greater<>`, so `begin()` is best on both sides), a `std::list` FIFO per level, and an `std::unordered_map<OrderId, Location>` index storing side, price and list iterator.
+**Options rejected:** a sorted `std::vector` of levels (cache-friendly, but O(L) insertion of a new price; a performance concern for Phase 3); `std::deque` per level (no O(1) erase in the middle, so cancels would shift elements).
+**Reason:** Each container's guarantees map directly to an exchange rule: sorted prices give price priority, list order gives time priority, and stable list iterators give O(1) cancel without disturbing queue position.
+
+## D-015 (2026-11-18): All outcomes are events with a fixed ordering contract
+**Choice:** The book reports everything (accept, reject, trade, cancel, cancel-reject, level update) through `OrderBookListener` virtual callbacks, in the order documented in `events.hpp`. Methods return `void`.
+**Options rejected:** return codes plus separate callbacks (two sources of truth); a templated listener (faster, but premature before measuring in Phase 4).
+**Reason:** One stream feeds the gateway, the market data feed and the journal, and lets the Phase 3 fast book be verified by exact stream comparison. The listener must not re-enter the book.
+
+## D-016 (2026-11-18): Order ID uniqueness is per resting order
+**Choice:** The book rejects an ID only while an order with that ID rests; IDs of filled or canceled orders may be reused. A cancel for a filled order is `CancelRejected(UnknownOrderId)`.
+**Reason:** Remembering every ID ever seen grows memory without bound. Day-long uniqueness per session belongs in the gateway (Phase 6).
+
+## D-017 (2026-11-18): Model-based testing against a naive oracle
+**Choice:** Besides scenario tests, randomized workloads run against both `MapOrderBook` and `tests/book/naive_book.hpp` (one flat vector, linear scans, no shared code), asserting identical event streams and invariants after every operation.
+**Reason:** Random operation sequences reach combinations nobody writes by hand. Verified non-vacuous by mutation: a planted LIFO bug and a planted `<` vs `<=` crossing bug were each caught (8 and 17 failing tests).
+
+## D-018 (2026-11-18): Hand-written exercises live outside the repository
+**Choice:** Each phase's practice function lives in `exercises/phase-N/` (gitignored). Its tests carry the ctest label `exercise`, are excluded from every normal test preset, and run via `ctest --preset exercises`. Project code never depends on exercise code (for example, the project uses `std::bit_ceil`, not the exercise's `next_power_of_two`).
+**Reason:** Unfinished exercises must never break CI or block the next phase, and exercises can be done at any time.

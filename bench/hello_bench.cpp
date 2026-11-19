@@ -1,5 +1,4 @@
 // Harness check: proves Google Benchmark builds, links and runs.
-// Also a baseline to compare the hand-written next_power_of_two against later.
 
 #include <benchmark/benchmark.h>
 

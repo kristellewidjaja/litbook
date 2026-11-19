@@ -20,7 +20,9 @@ include(Dependencies)
 
 # ---- Core library -----------------------------------------------------------
 add_library(litbook STATIC
-    src/version.cpp)
+    src/version.cpp
+    src/book/events.cpp
+    src/book/map_order_book.cpp)
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(litbook PRIVATE litbook::warnings)
@@ -33,4 +35,10 @@ endif()
 
 if(LITBOOK_BUILD_BENCH)
     add_subdirectory(bench)
+endif()
+
+# Optional local practice exercises (not part of the repository). Their tests carry
+# the label "exercise" and are excluded from the normal test presets.
+if(LITBOOK_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/exercises/CMakeLists.txt)
+    add_subdirectory(exercises)
 endif()

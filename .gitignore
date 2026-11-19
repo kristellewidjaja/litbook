@@ -34,7 +34,8 @@ __pycache__/
 .venv/
 *.so
 
-# Personal study notes and planning (kept local)
+# Personal study notes, planning and exercises (kept local)
 docs/learn/
+exercises/
 docs/ROADMAP.md
 docs/PROGRESS.md

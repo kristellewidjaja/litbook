@@ -49,7 +49,15 @@
       "name": "test-base",
       "hidden": true,
       "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+      "execution": { "noTestsAction": "error", "stopOnFailure": false },
+      "filter": { "exclude": { "label": "exercise" } }
+    },
+    {
+      "name": "exercises",
+      "displayName": "Local practice exercises only",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "exercise" } }
     },
     {
       "name": "asan-env",
