@@ -1,5 +1,6 @@
-// This is a long differential test. It runs FastOrderBook against MapOrderBook (the trusted
-// reference) on long random streams, without the slow naive oracle. The events from every
+// This is a long differential test. It runs FastOrderBook and SortedOrderBook, each
+// against MapOrderBook (the trusted reference), on long random streams, without the slow
+// naive oracle. The events from every
 // operation must match exactly, and the invariants are checked periodically.
 //
 // Each workload runs 100,000 operations by default, which is 1.5 million across all 15
@@ -9,6 +10,7 @@
 #include "litbook/book/fast_order_book.hpp"
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/recording_listener.hpp"
+#include "litbook/book/sorted_order_book.hpp"
 
 #include <gtest/gtest.h>
 
@@ -32,15 +34,16 @@ std::uint64_t operations_per_workload() {
 
 class DifferentialTest : public ::testing::TestWithParam<WorkloadParams> {};
 
-TEST_P(DifferentialTest, FastBookMatchesMapBook) {
-    const WorkloadParams& p = GetParam();
+// Replays one workload into MapOrderBook and `Book` and requires identical events.
+template <class Book>
+void run_against_map_book(const WorkloadParams& p) {
     const BookConfig config = testing::book_config(p);
     const std::uint64_t operations = operations_per_workload();
 
     RecordingListener map_rec;
     RecordingListener fast_rec;
     MapOrderBook map_book(map_rec, config);
-    FastOrderBook fast_book(fast_rec, config);
+    Book fast_book(fast_rec, config);
     testing::Generator gen(p);
 
     for (std::uint64_t op = 0; op < operations; ++op) {
@@ -58,7 +61,15 @@ TEST_P(DifferentialTest, FastBookMatchesMapBook) {
     }
     EXPECT_TRUE(fast_book.check_invariants());
     EXPECT_EQ(fast_book.order_count(), map_book.order_count());
-    RecordProperty("operations", std::to_string(operations));
+    ::testing::Test::RecordProperty("operations", std::to_string(operations));
+}
+
+TEST_P(DifferentialTest, FastBookMatchesMapBook) {
+    run_against_map_book<FastOrderBook>(GetParam());
+}
+
+TEST_P(DifferentialTest, SortedBookMatchesMapBook) {
+    run_against_map_book<SortedOrderBook>(GetParam());
 }
 
 INSTANTIATE_TEST_SUITE_P(Workloads, DifferentialTest,

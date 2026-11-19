@@ -29,6 +29,7 @@
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/order_request.hpp"
 #include "litbook/book/recording_listener.hpp"
+#include "litbook/book/sorted_order_book.hpp"
 #include "litbook/types.hpp"
 
 #include <cstddef>
@@ -133,9 +134,11 @@ int run_one(const std::uint8_t* data, std::size_t size) {
     RecordingListener naive_rec;
     RecordingListener map_rec;
     RecordingListener fast_rec;
+    RecordingListener sorted_rec;
     testing::NaiveBook naive(naive_rec, d.config);
     MapOrderBook map_book(map_rec, d.config);
     FastOrderBook fast_book(fast_rec, d.config);
+    SortedOrderBook sorted_book(sorted_rec, d.config);
 
     std::size_t index = 0;
     for (std::size_t at = kHeaderSize; at + kOpSize <= size; at += kOpSize, ++index) {
@@ -143,6 +146,7 @@ int run_one(const std::uint8_t* data, std::size_t size) {
         apply(naive, op);
         apply(map_book, op);
         apply(fast_book, op);
+        apply(sorted_book, op);
 
         if (map_rec.events() != naive_rec.events()) {
             fail("map events differ from the oracle", index);
@@ -150,28 +154,38 @@ int run_one(const std::uint8_t* data, std::size_t size) {
         if (fast_rec.events() != naive_rec.events()) {
             fail("fast events differ from the oracle", index);
         }
-        if (!map_book.check_invariants() || !fast_book.check_invariants()) {
+        if (sorted_rec.events() != naive_rec.events()) {
+            fail("sorted events differ from the oracle", index);
+        }
+        if (!map_book.check_invariants() || !fast_book.check_invariants() ||
+            !sorted_book.check_invariants()) {
             fail("invariant broken", index);
         }
         for (const Side side : {Side::Buy, Side::Sell}) {
             if (map_book.depth(side, 64) != fast_book.depth(side, 64) ||
-                map_book.level_count(side) != fast_book.level_count(side)) {
+                map_book.level_count(side) != fast_book.level_count(side) ||
+                map_book.depth(side, 64) != sorted_book.depth(side, 64) ||
+                map_book.level_count(side) != sorted_book.level_count(side)) {
                 fail("depth differs", index);
             }
         }
         if (map_book.best_bid() != naive.best(Side::Buy) ||
             map_book.best_ask() != naive.best(Side::Sell) ||
             fast_book.best_bid() != map_book.best_bid() ||
-            fast_book.best_ask() != map_book.best_ask()) {
+            fast_book.best_ask() != map_book.best_ask() ||
+            sorted_book.best_bid() != map_book.best_bid() ||
+            sorted_book.best_ask() != map_book.best_ask()) {
             fail("best price differs", index);
         }
         if (map_book.order_count() != naive.order_count() ||
-            fast_book.order_count() != naive.order_count()) {
+            fast_book.order_count() != naive.order_count() ||
+            sorted_book.order_count() != naive.order_count()) {
             fail("order count differs", index);
         }
         naive_rec.clear();
         map_rec.clear();
         fast_rec.clear();
+        sorted_rec.clear();
     }
     return 0;
 }

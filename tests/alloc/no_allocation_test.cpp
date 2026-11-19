@@ -11,6 +11,7 @@
 #include "litbook/book/fast_order_book.hpp"
 #include "litbook/book/listener.hpp"
 #include "litbook/book/map_order_book.hpp"
+#include "litbook/book/sorted_order_book.hpp"
 
 #include <gtest/gtest.h>
 
@@ -172,12 +173,14 @@ TEST(NoAllocationTest, MapOrderBookAllocates) {
     EXPECT_GT(count, 1'000U);
 }
 
-TEST(NoAllocationTest, FastOrderBookNeverAllocatesAfterConstruction) {
+// Replays every standard workload into a `Book` and requires zero allocations.
+template <class Book>
+void expect_no_allocations() {
     std::uint64_t total_operations = 0;
     for (const auto& params : testing::standard_workloads()) {
         const auto ops = testing::generate(params);
         CountingListener listener;
-        FastOrderBook book(listener, testing::book_config(params));
+        Book book(listener, testing::book_config(params));
         std::uint64_t count = 0;
         {
             const AllocationCounter counter;
@@ -191,7 +194,18 @@ TEST(NoAllocationTest, FastOrderBookNeverAllocatesAfterConstruction) {
         EXPECT_TRUE(book.check_invariants()) << params.name;
         total_operations += ops.size();
     }
-    RecordProperty("operations", static_cast<int>(total_operations));
+    ::testing::Test::RecordProperty("operations", static_cast<int>(total_operations));
+}
+
+TEST(NoAllocationTest, FastOrderBookNeverAllocatesAfterConstruction) {
+    expect_no_allocations<FastOrderBook>();
+}
+
+// The sorted book inserts into and erases from std::vector, which would allocate if the
+// vector ever had to grow. Its capacity is reserved in the constructor, and this proves
+// it never runs out.
+TEST(NoAllocationTest, SortedOrderBookNeverAllocatesAfterConstruction) {
+    expect_no_allocations<SortedOrderBook>();
 }
 
 }  // namespace

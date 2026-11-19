@@ -25,7 +25,9 @@ add_library(litbook STATIC
     src/book/book_config.cpp
     src/book/events.cpp
     src/book/fast_order_book.cpp
-    src/book/map_order_book.cpp)
+    src/book/map_order_book.cpp
+    src/book/sorted_order_book.cpp
+    src/itch/binary_file_reader.cpp)
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(litbook PRIVATE litbook::warnings)
@@ -43,6 +45,8 @@ endif()
 if(LITBOOK_BUILD_TESTS OR LITBOOK_FUZZ)
     add_subdirectory(fuzz)
 endif()
+
+add_subdirectory(tools)
 
 # These are optional local practice exercises, not part of the repository. Their tests
 # carry the label "exercise" and are excluded from the normal test presets.

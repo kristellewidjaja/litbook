@@ -8,6 +8,7 @@
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/order_request.hpp"
 #include "litbook/book/recording_listener.hpp"
+#include "litbook/book/sorted_order_book.hpp"
 
 #include <gtest/gtest.h>
 
@@ -19,13 +20,19 @@
 namespace litbook::testing {
 
 // This is the list of book implementations that the shared typed tests run against.
-using BookTypes = ::testing::Types<MapOrderBook, FastOrderBook>;
+using BookTypes = ::testing::Types<MapOrderBook, FastOrderBook, SortedOrderBook>;
 
-// This names the typed-test instances "Map" and "Fast" instead of 0 and 1.
+// This names the typed-test instances "Map", "Fast" and "Sorted" instead of 0, 1 and 2.
 struct BookTypeNames {
     template <class Book>
     static std::string GetName(int /*index*/) {  // NOLINT(readability-identifier-naming)
-        return std::is_same_v<Book, MapOrderBook> ? "Map" : "Fast";
+        if constexpr (std::is_same_v<Book, MapOrderBook>) {
+            return "Map";
+        } else if constexpr (std::is_same_v<Book, FastOrderBook>) {
+            return "Fast";
+        } else {
+            return "Sorted";
+        }
     }
 };
 

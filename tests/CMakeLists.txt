@@ -11,7 +11,11 @@ add_executable(litbook_tests
     book/order_book_model_test.cpp
     book/map_order_book_test.cpp
     book/fast_order_book_test.cpp
+    book/sorted_order_book_test.cpp
     book/differential_test.cpp
+    itch/binary_file_reader_test.cpp
+    itch/book_builder_test.cpp
+    itch/itch_parser_test.cpp
     metrics/latency_histogram_test.cpp
     metrics/tick_clock_test.cpp)
 

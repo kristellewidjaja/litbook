@@ -6,6 +6,7 @@
 #include "litbook/book/fast_order_book.hpp"
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/recording_listener.hpp"
+#include "litbook/book/sorted_order_book.hpp"
 
 #include <gtest/gtest.h>
 
@@ -84,37 +85,50 @@ TEST_P(OrderBookModelTest, AllBooksMatchTheNaiveOracle) {
     RecordingListener naive_rec;
     RecordingListener map_rec;
     RecordingListener fast_rec;
+    RecordingListener sorted_rec;
     testing::NaiveBook naive(naive_rec, config);
     MapOrderBook map_book(map_rec, config);
     FastOrderBook fast_book(fast_rec, config);
+    SortedOrderBook sorted_book(sorted_rec, config);
     Coverage cov;
 
     for (std::size_t op = 0; op < ops.size(); ++op) {
         testing::apply(naive, ops[op]);
         testing::apply(map_book, ops[op]);
         testing::apply(fast_book, ops[op]);
+        testing::apply(sorted_book, ops[op]);
 
         ASSERT_EQ(map_rec.events(), naive_rec.events()) << "map diverged at operation " << op;
         ASSERT_EQ(fast_rec.events(), naive_rec.events()) << "fast diverged at operation " << op;
+        ASSERT_EQ(sorted_rec.events(), naive_rec.events()) << "sorted diverged at operation " << op;
         ASSERT_TRUE(map_book.check_invariants()) << "map invariant broken at operation " << op;
         ASSERT_TRUE(fast_book.check_invariants()) << "fast invariant broken at operation " << op;
+        ASSERT_TRUE(sorted_book.check_invariants())
+            << "sorted invariant broken at operation " << op;
         ASSERT_EQ(map_book.best_bid(), naive.best(Side::Buy)) << "operation " << op;
         ASSERT_EQ(map_book.best_ask(), naive.best(Side::Sell)) << "operation " << op;
         ASSERT_EQ(fast_book.best_bid(), map_book.best_bid()) << "operation " << op;
         ASSERT_EQ(fast_book.best_ask(), map_book.best_ask()) << "operation " << op;
+        ASSERT_EQ(sorted_book.best_bid(), map_book.best_bid()) << "operation " << op;
+        ASSERT_EQ(sorted_book.best_ask(), map_book.best_ask()) << "operation " << op;
         for (const Side side : {Side::Buy, Side::Sell}) {
             ASSERT_EQ(fast_book.depth(side, 3), map_book.depth(side, 3)) << "operation " << op;
+            ASSERT_EQ(sorted_book.depth(side, 3), map_book.depth(side, 3)) << "operation " << op;
+            ASSERT_EQ(sorted_book.level_count(side), map_book.level_count(side))
+                << "operation " << op;
             ASSERT_EQ(fast_book.level_count(side), map_book.level_count(side))
                 << "operation " << op;
         }
         ASSERT_EQ(map_book.order_count(), naive.order_count()) << "operation " << op;
         ASSERT_EQ(fast_book.order_count(), naive.order_count()) << "operation " << op;
+        ASSERT_EQ(sorted_book.order_count(), naive.order_count()) << "operation " << op;
         for (const BookEvent& e : naive_rec.events()) {
             cov.count(e);
         }
         naive_rec.clear();
         map_rec.clear();
         fast_rec.clear();
+        sorted_rec.clear();
     }
 
     // Every workload must exercise every core path at least once...
