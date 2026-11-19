@@ -18,9 +18,14 @@ namespace litbook {
 //
 // The table size is a power of two at least twice max_entries, so the load factor never
 // exceeds 50% and probe sequences stay short.
-// The hash is Fibonacci hashing. We multiply the key by 2^64 / golden ratio and keep the
-// top bits. This spreads sequential IDs, the common case, evenly. It is not hardened
-// against adversarial keys, which is fine for exchange-assigned IDs.
+// The hash folds the key. It cuts the 64-bit key into chunks as wide as the table index
+// and XORs them together. Exchange IDs are handed out in increasing order, so IDs that
+// arrive close together land in nearby slots, and the slots touched by recent orders
+// stay in cache. Fibonacci hashing, used before, scatters nearby IDs across the whole
+// table. On a full Nasdaq day the fold won 4 of 5 before/after pairs, with the median
+// replay CPU time about 6% lower (see DECISIONS.md D-039). Every bit of the key still reaches the index, so keys that
+// differ only in high bits do not all collide. It is not hardened against adversarial
+// keys, which is fine for exchange-assigned IDs.
 // Erase uses backward-shift deletion instead of tombstones (markers left in deleted
 // slots), so the table never fills up with dead slots under heavy churn.
 //
@@ -40,7 +45,7 @@ public:
         const std::size_t table = std::bit_ceil(std::max<std::size_t>(2 * max_entries, 16));
         slots_.resize(table);
         mask_ = table - 1;
-        shift_ = 64 - std::countr_zero(table);
+        bits_ = std::countr_zero(table);
     }
 
     // Stores `value` under `key`. Returns false and changes nothing if the key is already
@@ -105,6 +110,19 @@ public:
     [[nodiscard]] std::size_t max_entries() const noexcept { return max_entries_; }
     [[nodiscard]] std::size_t table_size() const noexcept { return slots_.size(); }
 
+    // The longest distance any stored key sits from its home slot, found by scanning the
+    // whole table in O(table size). A lookup for a key never reads more slots than this
+    // plus one, so tests use it to check that keys do not pile up. Meant for tests.
+    [[nodiscard]] std::size_t longest_probe() const noexcept {
+        std::size_t longest = 0;
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            if (slots_[i].value != kNotFound) {
+                longest = std::max(longest, (i - home(slots_[i].key)) & mask_);
+            }
+        }
+        return longest;
+    }
+
     // Checks the probe invariant for every stored key in O(table_size()) time. For tests.
     [[nodiscard]] bool check_invariants() const {
         std::size_t count = 0;
@@ -128,13 +146,18 @@ private:
         Value value = kNotFound;  // kNotFound marks an empty slot, because any key value is legal.
     };
 
+    // The slot where a key's probe sequence starts.
     [[nodiscard]] std::size_t home(Key key) const noexcept {
-        return static_cast<std::size_t>((key * 0x9E3779B97F4A7C15ULL) >> shift_);
+        Key h = key;
+        for (int s = bits_; s < 64; s += bits_) {
+            h ^= key >> s;
+        }
+        return static_cast<std::size_t>(h) & mask_;
     }
 
     std::vector<Slot> slots_;
     std::size_t mask_ = 0;
-    int shift_ = 0;
+    int bits_ = 0;  // width of a table index, log2 of the table size
     std::size_t size_ = 0;
     std::size_t max_entries_;
 };

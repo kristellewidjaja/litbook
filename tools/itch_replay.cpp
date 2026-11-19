@@ -3,6 +3,7 @@
 //
 // Usage:
 //   gunzip -c data/12302019.NASDAQ_ITCH50.gz | litbook_itch_replay sizes.csv MODE [--ladder-stocks]
+//   [--untimed] [--sample-every N]
 //
 // sizes.csv comes from litbook_itch_stats and gives each stock's peak number of resting
 // orders and its price range, so every book is sized before the day starts.
@@ -13,10 +14,17 @@
 //   fast     FastOrderBook, only for the stocks whose whole price range fits a small
 //            ladder (most stocks have stub quotes from $0.0001 to $199,999.99, which no
 //            ladder can hold)
+//   null     a book that does nothing, run through the same pipeline. Its CPU time is
+//            the cost of reading, decoding and tracking orders, so subtracting it
+//            from an untimed run of a real book leaves that book's own cost.
 //   verify   MapOrderBook and SortedOrderBook side by side. After every message their
 //            events must be identical. Nothing is timed.
 // --ladder-stocks limits map and sorted to the same stocks fast can hold, so all three
 // can be compared on identical input.
+// --untimed skips the timer reads. Comparing the CPU time of the message loop with and
+// without them shows how much the measurement itself costs.
+// --sample-every N times one message in every N (default 64). N = 1 times every message,
+// which is how Phase 4b measured.
 //
 // How ITCH maps onto the book. ITCH reports what already happened on Nasdaq, after
 // matching. So an add becomes a resting limit order, an execution or a partial cancel
@@ -29,10 +37,19 @@
 // The translation itself is ItchBookBuilder (include/litbook/itch/book_builder.hpp),
 // which has its own unit tests.
 //
-// What is timed. Only the calls into the book, one sample per ITCH message (a replace is
+// What is timed. Only the calls into the book for one ITCH message in every N (a replace is
 // two calls, timed together). Reading, decompressing and decoding the file, and the
 // builder's own table that turns "execute 100 shares of order X" into a new size, are
 // not timed. Each book's listener only counts events.
+//
+// Why only one message in N. Reading the timer is not free on this machine. The isb
+// instruction in TickClock::now() makes the CPU finish everything in flight before it
+// reads the counter, and timing every message added roughly 40 to 100 ns of CPU time per
+// message, about as much as the sorted book itself costs. Timing one message in 64 spreads
+// that cost so thinly that the book runs at nearly its natural speed, and 64 still leaves
+// about four million samples for the percentiles. Each sample still contains one timer
+// read, so the tool also measures the timer floor, the reading for a call that does
+// nothing, and prints it next to the results.
 
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/events.hpp"
@@ -48,12 +65,15 @@
 #include "litbook/metrics/latency_histogram.hpp"
 #include "litbook/metrics/tick_clock.hpp"
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -194,18 +214,22 @@ private:
     std::uint64_t mismatches_ = 0;
 };
 
-// Times every group of book calls the builder makes for one message.
+// Times one group of book calls in every `every`, counting down in *countdown. When
+// enabled is false nothing is timed.
 struct Timer {
     LatencyHistogram* ticks;
     std::uint64_t* total_ticks;
+    std::uint64_t* countdown;
+    std::uint64_t every;
     bool enabled;
 
     template <class F>
     void operator()(F&& call) const {
-        if (!enabled) {
+        if (!enabled || --*countdown != 0) {
             call();
             return;
         }
+        *countdown = every;
         const std::uint64_t start = TickClock::now();
         call();
         const std::uint64_t elapsed = TickClock::now() - start;
@@ -216,15 +240,36 @@ struct Timer {
 
 // Builds one book per selected stock, sized from the stats file, inside an
 // ItchBookBuilder that does the ITCH-to-book translation.
+// Accepts every call and does nothing, for the null mode described at the top.
+class NullBook {
+public:
+    NullBook(OrderBookListener& /*listener*/, BookConfig /*config*/) {}
+    void submit(const OrderRequest& r) { checksum_ += r.id; }
+    void cancel(OrderId id) { checksum_ += id; }
+    void modify(OrderId id, Price /*p*/, Qty q) { checksum_ += id + q; }
+    [[nodiscard]] std::size_t order_count() const { return 0; }
+    [[nodiscard]] bool check_invariants() const { return true; }
+    [[nodiscard]] std::uint64_t checksum() const { return checksum_; }
+
+private:
+    // A running sum of the arguments, so the compiler cannot drop the calls entirely.
+    std::uint64_t checksum_ = 0;
+};
+
 template <class Book>
 class Replayer {
 public:
     // More than the 1.9 million orders that rest at the busiest moment of the sample day.
     static constexpr std::uint32_t kMaxLiveOrders = std::uint32_t{1} << 22U;
 
-    Replayer(const std::vector<std::optional<StockInfo>>& stocks, bool ladder_only, bool timed)
-        : builder_(kMaxLiveOrders,
-                   Timer{.ticks = &ticks_, .total_ticks = &total_ticks_, .enabled = timed}) {
+    Replayer(const std::vector<std::optional<StockInfo>>& stocks, bool ladder_only, bool timed,
+             std::uint64_t sample_every)
+        : countdown_(sample_every),
+          builder_(kMaxLiveOrders, Timer{.ticks = &ticks_,
+                                         .total_ticks = &total_ticks_,
+                                         .countdown = &countdown_,
+                                         .every = sample_every,
+                                         .enabled = timed}) {
         for (std::size_t locate = 0; locate < stocks.size(); ++locate) {
             const std::optional<StockInfo>& s = stocks[locate];
             if (!s || (ladder_only && !s->fits_ladder())) {
@@ -284,26 +329,60 @@ private:
     HealthListener health_;
     LatencyHistogram ticks_;
     std::uint64_t total_ticks_ = 0;
+    std::uint64_t countdown_;
     std::size_t book_count_ = 0;
     itch::ItchBookBuilder<Book, Timer> builder_;  // last, so the pointers above outlive it
 };
 
+// CPU time used by this process so far, user plus system, in seconds. The gunzip that
+// feeds the pipe is a separate process and is not included.
+double process_cpu_seconds() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    const auto seconds = [](const timeval& t) {
+        return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) * 1e-6;
+    };
+    return seconds(usage.ru_utime) + seconds(usage.ru_stime);
+}
+
+struct Options {
+    bool ladder_only = false;
+    bool untimed = false;
+    std::uint64_t sample_every = 64;
+};
+
+// Times a call that does nothing many times, the same way the replay times the book. The
+// result is the smallest reading the timer can give, which is part of every sample.
+LatencyHistogram timer_floor() {
+    LatencyHistogram floor;
+    for (int i = 0; i < 1'000'000; ++i) {
+        const std::uint64_t start = TickClock::now();
+        const std::uint64_t elapsed = TickClock::now() - start;
+        floor.record(elapsed);
+    }
+    return floor;
+}
+
 template <class Book>
-int run(const std::vector<std::optional<StockInfo>>& stocks, const char* mode, bool ladder_only) {
+int run(const std::vector<std::optional<StockInfo>>& stocks, const char* mode, Options options) {
     const bool verify = std::is_same_v<Book, VerifyBook>;
+    const bool ladder_only = options.ladder_only;
+    const bool timed = !verify && !options.untimed;
     const auto wall_start = std::chrono::steady_clock::now();
-    Replayer<Book> replay(stocks, ladder_only, !verify);
+    Replayer<Book> replay(stocks, ladder_only, timed, options.sample_every);
     const double setup_s =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
 
     itch::BinaryFileReader reader(stdin, std::size_t{1} << 24U);
     std::span<const std::byte> payload;
+    const double cpu_start = process_cpu_seconds();
     std::uint64_t messages = 0;
     itch::BinaryFileReader::Status status{};
     while ((status = reader.next(payload)) == itch::BinaryFileReader::Status::Message) {
         ++messages;
         (void)itch::parse_message(payload, replay.builder());
     }
+    const double loop_cpu_s = process_cpu_seconds() - cpu_start;
     const double wall_s =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
 
@@ -317,6 +396,10 @@ int run(const std::vector<std::optional<StockInfo>>& stocks, const char* mode, b
     std::printf("ITCH messages read: %llu, messages sent to a book: %llu, wall time %.1f s\n",
                 static_cast<unsigned long long>(messages),
                 static_cast<unsigned long long>(replay.book_messages()), wall_s);
+    std::printf(
+        "CPU time of this process for the message loop (reading, decoding, replaying): "
+        "%.1f s\n",
+        loop_cpu_s);
     std::printf(
         "health: trades %llu, rejects %llu, book-full cancels %llu (all must be 0); "
         "events %llu\n",
@@ -343,20 +426,25 @@ int run(const std::vector<std::optional<StockInfo>>& stocks, const char* mode, b
     if constexpr (std::is_same_v<Book, VerifyBook>) {
         std::printf("map vs sorted: messages with different events: %llu\n",
                     static_cast<unsigned long long>(mismatches));
+    } else if (!timed) {
+        std::printf("untimed: no per-message timer reads\n");
     } else {
         const double tick = TickClock::tick_ns();
         const LatencyHistogram& hist = replay.histogram();
-        const double book_s = static_cast<double>(replay.book_ticks()) * tick * 1e-9;
-        const auto n = static_cast<double>(replay.book_messages());
+        const auto samples = static_cast<double>(hist.count());
+        const double sampled_ns = static_cast<double>(replay.book_ticks()) * tick / samples;
         std::printf(
-            "book time: %.2f s total, %.1f ns per message on average, %.2f million "
-            "messages per second of book time\n",
-            book_s, book_s * 1e9 / n, n / book_s / 1e6);
-        std::printf("per message (ns, 1 tick = %.2f ns):", tick);
+            "timed one message in %llu: %.0f samples, %.1f ns per timed message on average\n",
+            static_cast<unsigned long long>(options.sample_every), samples, sampled_ns);
+        std::printf("per timed message (ns, 1 tick = %.2f ns):", tick);
         for (const double p : {50.0, 90.0, 99.0, 99.9, 99.99}) {
             std::printf("  p%g %.0f", p, static_cast<double>(hist.percentile(p)) * tick);
         }
         std::printf("  max %.0f\n", static_cast<double>(hist.max()) * tick);
+        const LatencyHistogram floor = timer_floor();
+        std::printf("timer floor (ns, an empty call timed the same way): p50 %.0f  p99 %.0f\n",
+                    static_cast<double>(floor.percentile(50.0)) * tick,
+                    static_cast<double>(floor.percentile(99.0)) * tick);
     }
     const bool ok = healthy && mismatches == 0;
     std::printf("%s\n", ok ? "RESULT: OK" : "RESULT: PROBLEM");
@@ -369,7 +457,8 @@ int main(int argc, char** argv) try {
     if (argc < 3) {
         std::fprintf(
             stderr,
-            "usage: litbook_itch_replay sizes.csv map|sorted|fast|verify [--ladder-stocks]\n");
+            "usage: litbook_itch_replay sizes.csv map|sorted|fast|null|verify [--ladder-stocks] "
+            "[--untimed] [--sample-every N]\n");
         return 2;
     }
     const auto stocks = load_sizes(argv[1]);
@@ -378,18 +467,39 @@ int main(int argc, char** argv) try {
         return 2;
     }
     const std::string_view mode = argv[2];
-    const bool ladder_only = argc > 3 && std::string_view(argv[3]) == "--ladder-stocks";
+    Options options;
+    for (int i = 3; i < argc; ++i) {
+        const std::string_view flag = argv[i];
+        if (flag == "--ladder-stocks") {
+            options.ladder_only = true;
+        } else if (flag == "--untimed") {
+            options.untimed = true;
+        } else if (flag == "--sample-every" && i + 1 < argc) {
+            options.sample_every = std::strtoull(argv[++i], nullptr, 10);
+            if (options.sample_every == 0) {
+                std::fprintf(stderr, "--sample-every needs a number of at least 1\n");
+                return 2;
+            }
+        } else {
+            std::fprintf(stderr, "unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
     if (mode == "map") {
-        return run<MapOrderBook>(stocks, argv[2], ladder_only);
+        return run<MapOrderBook>(stocks, argv[2], options);
     }
     if (mode == "sorted") {
-        return run<SortedOrderBook>(stocks, argv[2], ladder_only);
+        return run<SortedOrderBook>(stocks, argv[2], options);
     }
     if (mode == "fast") {
-        return run<FastOrderBook>(stocks, argv[2], true);
+        options.ladder_only = true;
+        return run<FastOrderBook>(stocks, argv[2], options);
+    }
+    if (mode == "null") {
+        return run<NullBook>(stocks, argv[2], options);
     }
     if (mode == "verify") {
-        return run<VerifyBook>(stocks, argv[2], ladder_only);
+        return run<VerifyBook>(stocks, argv[2], options);
     }
     std::fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

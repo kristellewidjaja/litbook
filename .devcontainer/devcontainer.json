@@ -3,7 +3,7 @@
   "build": { "dockerfile": "Dockerfile" },
   "workspaceMount": "source=${localWorkspaceFolder},target=/work,type=bind",
   "workspaceFolder": "/work",
-  "runArgs": ["--cap-add=SYS_PTRACE", "--hostname=litbook-dev"],
+  "runArgs": ["--cap-add=SYS_PTRACE", "--cap-add=PERFMON", "--hostname=litbook-dev"],
   "customizations": {
     "vscode": {
       "extensions": [

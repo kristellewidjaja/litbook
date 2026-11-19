@@ -34,6 +34,13 @@
     { "name": "asan-clang",    "displayName": "ASan + UBSan (Clang)", "inherits": ["clang", "asan"] },
     { "name": "tsan-clang",    "displayName": "TSan (Clang)",         "inherits": ["clang", "tsan"] },
 
+    { "name": "profile", "displayName": "Release -O3 with symbols and frame pointers, for perf (GCC)",
+      "inherits": ["base", "gcc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS": "-g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
+      } },
+
     { "name": "fuzz", "displayName": "libFuzzer + ASan + UBSan (Clang)", "inherits": ["base", "clang"],
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
@@ -53,6 +60,7 @@
     { "name": "release-clang", "configurePreset": "release-clang" },
     { "name": "asan-clang",    "configurePreset": "asan-clang" },
     { "name": "tsan-clang",    "configurePreset": "tsan-clang" },
+    { "name": "profile",       "configurePreset": "profile" },
     { "name": "fuzz",          "configurePreset": "fuzz" }
   ],
   "testPresets": [

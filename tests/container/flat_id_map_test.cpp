@@ -105,6 +105,29 @@ TEST(FlatIdMapTest, FullTinyTableWithCollisionsAndWraparound) {
     }
 }
 
+// Keys with a large power-of-two stride are the worst case for a hash that only keeps the
+// low bits of the key. Every key would land in the same home slot and form one long run.
+// The hash must spread them, so lookups stay short.
+TEST(FlatIdMapTest, StridedKeysDoNotPileUp) {
+    for (const unsigned stride_bits : {10U, 16U, 20U, 32U}) {
+        FlatIdMap map(4'096);
+        for (FlatIdMap::Key k = 1; k <= 4'096; ++k) {
+            ASSERT_TRUE(map.insert(k << stride_bits, static_cast<FlatIdMap::Value>(k)));
+        }
+        EXPECT_LT(map.longest_probe(), 64U) << "stride 2^" << stride_bits;
+        EXPECT_TRUE(map.check_invariants());
+    }
+}
+
+// Sequential keys, the usual shape of order IDs, also stay short.
+TEST(FlatIdMapTest, SequentialKeysDoNotPileUp) {
+    FlatIdMap map(100'000);
+    for (FlatIdMap::Key k = 1'000'000; k < 1'100'000; ++k) {
+        ASSERT_TRUE(map.insert(k, static_cast<FlatIdMap::Value>(k % 1'000)));
+    }
+    EXPECT_LT(map.longest_probe(), 64U);
+}
+
 // Random insert/erase/find against std::unordered_map, with keys from a small range
 // so the same keys come and go many times (the backward-shift erase is exercised hard).
 TEST(FlatIdMapTest, RandomChurnMatchesUnorderedMap) {

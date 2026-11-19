@@ -12,9 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gdb \
         git ca-certificates \
         python3 \
+        linux-perf \
     && rm -rf /var/lib/apt/lists/*
-# llvm: provides llvm-symbolizer, so sanitizer stack traces show file:line.
-# libclang-rt-dev: Clang's sanitizer and libFuzzer runtimes.
+# llvm provides llvm-symbolizer, so sanitizer stack traces show file:line.
+# libclang-rt-dev holds Clang's sanitizer and libFuzzer runtimes.
+# linux-perf provides perf. On Ubuntu 26.04 it is a single binary that is not tied to
+# one kernel version, so it works with Docker Desktop's own kernel. That VM exposes no
+# hardware counters, so profile with software events (perf record -e cpu-clock).
 
 # The repo is bind-mounted from the host, so its files are owned by a different
 # user than the container's; tell git that is expected.

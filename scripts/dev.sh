@@ -26,9 +26,11 @@ if [ -t 0 ] && [ -t 1 ]; then
     tty_flags=(-it)
 fi
 
-# SYS_PTRACE: LeakSanitizer (part of ASan) uses ptrace to inspect the process at exit.
+# SYS_PTRACE lets LeakSanitizer (part of ASan) inspect the process at exit.
+# PERFMON lets perf open sampling events inside the container.
 exec docker run --rm "${tty_flags[@]}" \
     --hostname litbook-dev \
     --cap-add SYS_PTRACE \
+    --cap-add PERFMON \
     -v "$repo":/work -w /work \
     "$image" "$@"
