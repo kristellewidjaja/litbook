@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <vector>
@@ -26,8 +27,12 @@ public:
         return *this;
     }
     Stream& end_of_session() { return raw({0, 0}); }
-    Stream& raw(std::vector<unsigned char> b) {
-        bytes_.insert(bytes_.end(), b.begin(), b.end());
+    // Appends bytes one at a time. A range insert here trips a false -Warray-bounds
+    // error in GCC 14 at -O3 (the compiler CI uses), so this is deliberately a loop.
+    Stream& raw(std::initializer_list<unsigned char> b) {
+        for (const unsigned char byte : b) {
+            bytes_.push_back(byte);
+        }
         return *this;
     }
 
