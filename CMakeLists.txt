@@ -28,6 +28,9 @@ add_library(litbook STATIC
     src/book/map_order_book.cpp
     src/book/sorted_order_book.cpp
     src/engine/engine.cpp
+    src/gateway/session.cpp
+    src/gateway/socket.cpp
+    src/gateway/soup.cpp
     src/itch/binary_file_reader.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)

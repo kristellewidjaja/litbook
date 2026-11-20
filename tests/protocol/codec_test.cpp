@@ -259,7 +259,8 @@ TEST(CodecTest, RoundTripsEveryEnumValue) {
     for (const WireRejectReason r :
          {WireRejectReason::Other, WireRejectReason::InvalidQuantity,
           WireRejectReason::InvalidSymbol, WireRejectReason::InvalidPrice,
-          WireRejectReason::PostOnlyWouldCross, WireRejectReason::InvalidOrderType}) {
+          WireRejectReason::MaxQuantityExceeded, WireRejectReason::PostOnlyWouldCross,
+          WireRejectReason::InvalidOrderType, WireRejectReason::MaxOpenOrdersExceeded}) {
         RejectedMessage j = kRejected;
         j.reason = r;
         EXPECT_EQ(decode_outbound(encoded(j)).message, OutboundMessage{j});

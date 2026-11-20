@@ -64,7 +64,9 @@ enum class WireCancelReason : char {
     UserRequested = 'U',        // The client sent a cancel.
     ImmediateOrCancel = 'I',    // The unfilled part of an IOC, FOK or market order.
     SelfMatchPrevention = 'Q',  // It would have traded with the same owner.
-    System = 'Z',               // The exchange canceled it (the book was full).
+    // The exchange canceled it, because the book was full or because the account's
+    // connection dropped and the account asked for cancel on disconnect.
+    System = 'Z',
 };
 
 // Why an order or a replace was refused. The values below 0x0100 are OUCH's own codes.
@@ -74,8 +76,10 @@ enum class WireRejectReason : std::uint16_t {
     InvalidQuantity = 0x0013,
     InvalidSymbol = 0x0017,
     InvalidPrice = 0x001D,
+    MaxQuantityExceeded = 0x0031,  // OUCH's "Risk: Max Quantity Exceeded".
     PostOnlyWouldCross = 0x0101,
     InvalidOrderType = 0x0102,
+    MaxOpenOrdersExceeded = 0x0103,  // The account already has its limit of live orders.
 };
 
 // Whether an execution added liquidity (the order was resting) or removed it (the order

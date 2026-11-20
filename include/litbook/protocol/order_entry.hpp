@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <variant>
@@ -33,6 +34,17 @@ protected:
     OutboundSink(OutboundSink&&) = default;
     OutboundSink& operator=(const OutboundSink&) = default;
     OutboundSink& operator=(OutboundSink&&) = default;
+};
+
+// Pre-trade risk limits for one account. An Enter Order or Replace Order that breaks one
+// is refused before it reaches the book. The defaults are so large that they never apply.
+struct RiskLimits {
+    // The largest Quantity field an Enter Order or Replace Order may carry. For a replace
+    // this is the order's new total size, counting shares that already executed.
+    Qty max_order_qty = std::numeric_limits<Qty>::max();
+    // The most orders the account may have live at the same time.
+    std::uint32_t max_open_orders = std::numeric_limits<std::uint32_t>::max();
+    bool operator==(const RiskLimits&) const = default;
 };
 
 struct OrderEntryConfig {
@@ -64,9 +76,15 @@ struct OrderEntryStats {
 // connect them to one record per live order, kept in an IndexPool. Everything is
 // allocated in the constructor and in add_symbol, so handling a message never allocates.
 //
+// Each account also has a small state struct with its last UserRefNum, its risk limits,
+// its number of live orders, and the head of a linked list through the records of its
+// live orders. The list lets cancel_all() find one account's orders without scanning
+// everyone else's.
+//
 // These invariants hold between calls. Every live order has exactly one record, reachable
-// from both maps, and its open quantity equals the quantity resting in its book. A record
-// is released as soon as its order has no open quantity left. last_user_ref(owner) only
+// from both maps and from its account's list, and its open quantity equals the quantity
+// resting in its book. A record is released as soon as its order has no open quantity
+// left. open_orders(owner) is the length of that account's list. last_user_ref(owner) only
 // grows.
 template <OrderBook Book>
 class OrderEntry final : private EngineListener {
@@ -80,7 +98,7 @@ public:
           records_(config.max_live_orders),
           by_client_(config.max_live_orders),
           by_ref_(config.max_live_orders),
-          last_user_ref_(static_cast<std::size_t>(config.max_owners) + 1, 0) {}
+          accounts_(static_cast<std::size_t>(config.max_owners) + 1) {}
 
     OrderEntry(const OrderEntry&) = delete;
     OrderEntry& operator=(const OrderEntry&) = delete;
@@ -91,6 +109,12 @@ public:
     // Lists a stock. This is a startup call, see Engine::add_symbol.
     SymbolId add_symbol(Ticker ticker, const BookConfig& config) {
         return engine_.add_symbol(ticker, config);
+    }
+
+    // Sets the risk limits of one account. This is a startup call. Throws
+    // std::out_of_range for owner 0 or an owner above max_owners.
+    void set_risk_limits(OwnerId owner, const RiskLimits& limits) {
+        account_at(owner).limits = limits;
     }
 
     // Decodes one inbound frame from `owner` and handles it. A malformed frame is counted
@@ -116,10 +140,44 @@ public:
         std::visit([&](const auto& m) { on_message(owner, m); }, message);
     }
 
+    // Cancels every live order of `owner`, for example because its connection dropped and
+    // the account asked for cancel on disconnect. Each order gets an Order Canceled with
+    // reason System ('Z'), as if the exchange had canceled it. Returns the number of
+    // orders canceled. A bad owner is counted and nothing happens.
+    std::uint32_t cancel_all(OwnerId owner, Timestamp now) {
+        if (owner == kNoOwner || owner > config_.max_owners) {
+            ++stats_.bad_owner;
+            return 0;
+        }
+        now_ = now;
+        pending_ = PendingCall{.kind = PendingCall::Kind::CancelAll};
+        std::uint32_t canceled = 0;
+        Index i = accounts_[owner].first_order;
+        while (i != kNoRecord) {
+            // Canceling the order releases its record and unlinks it from the list, so
+            // the next index has to be read first. A cancel never trades, so no other
+            // record of this account changes during the call.
+            const Index next = records_[i].next_of_owner;
+            engine_.cancel(records_[i].symbol, records_[i].ref);
+            ++canceled;
+            i = next;
+        }
+        pending_ = PendingCall{};
+        return canceled;
+    }
+
     [[nodiscard]] const Engine<Book>& engine() const noexcept { return engine_; }
     [[nodiscard]] const OrderEntryStats& stats() const noexcept { return stats_; }
     [[nodiscard]] std::uint32_t live_orders() const noexcept { return records_.in_use(); }
-    [[nodiscard]] UserRefNum last_user_ref(OwnerId owner) const { return last_user_ref_.at(owner); }
+    [[nodiscard]] UserRefNum last_user_ref(OwnerId owner) const {
+        return account_at(owner).last_user_ref;
+    }
+    [[nodiscard]] std::uint32_t open_orders(OwnerId owner) const {
+        return account_at(owner).open_orders;
+    }
+    [[nodiscard]] const RiskLimits& risk_limits(OwnerId owner) const {
+        return account_at(owner).limits;
+    }
 
 private:
     // Everything the order entry layer needs to know about one live order.
@@ -132,8 +190,20 @@ private:
         Price price;
         Qty open;      // Shares still resting (or about to rest) in the book.
         Qty executed;  // Shares executed so far, over the order's whole life.
+        // The neighbors of this record in its account's list of live orders.
+        std::uint32_t prev_of_owner;
+        std::uint32_t next_of_owner;
     };
     using Index = IndexPool<Record>::Index;
+    static constexpr Index kNoRecord = IndexPool<Record>::kNone;
+
+    // Everything the order entry layer keeps per account.
+    struct Account {
+        UserRefNum last_user_ref = 0;
+        RiskLimits limits;
+        std::uint32_t open_orders = 0;  // The number of records in the list below.
+        Index first_order = kNoRecord;  // The head of the list of live orders.
+    };
 
     // A cancel that shrinks an order and a replace both work by calling the book's
     // modify(). The book answers through the event handlers below, while modify() is
@@ -152,7 +222,7 @@ private:
     //    and cancels the original order. That cancel is a new call into the engine,
     //    which is allowed again now that modify() has returned.
     struct PendingCall {
-        enum class Kind : std::uint8_t { None, Reduce, Replace };
+        enum class Kind : std::uint8_t { None, Reduce, Replace, CancelAll };
         Kind kind = Kind::None;
         UserRefNum new_user_ref = 0;  // Only used by a replace.
         bool refused = false;         // Set if the book sent ModifyRejected.
@@ -166,13 +236,26 @@ private:
         return config;
     }
 
+    Account& account_at(OwnerId owner) {
+        if (owner == kNoOwner || owner > config_.max_owners) {
+            throw std::out_of_range("OrderEntry account number out of range");
+        }
+        return accounts_[owner];
+    }
+    const Account& account_at(OwnerId owner) const {
+        if (owner == kNoOwner || owner > config_.max_owners) {
+            throw std::out_of_range("OrderEntry account number out of range");
+        }
+        return accounts_[owner];
+    }
+
     static FlatIdMap::Key client_key(OwnerId owner, UserRefNum user_ref) noexcept {
         return (static_cast<std::uint64_t>(owner) << 32U) | user_ref;
     }
 
     // Applies the UserRefNum rule. Returns false if the message must be ignored.
     bool take_user_ref(OwnerId owner, UserRefNum user_ref) noexcept {
-        UserRefNum& last = last_user_ref_[owner];
+        UserRefNum& last = accounts_[owner].last_user_ref;
         if (user_ref <= last) {
             ++stats_.stale_user_ref;
             return false;
@@ -185,10 +268,38 @@ private:
         return by_client_.find(client_key(owner, user_ref));
     }
 
+    // Puts record i at the front of its account's list.
+    void link_to_owner(Index i) noexcept {
+        Record& r = records_[i];
+        Account& account = accounts_[r.owner];
+        r.prev_of_owner = kNoRecord;
+        r.next_of_owner = account.first_order;
+        if (account.first_order != kNoRecord) {
+            records_[account.first_order].prev_of_owner = i;
+        }
+        account.first_order = i;
+        ++account.open_orders;
+    }
+
+    void unlink_from_owner(Index i) noexcept {
+        const Record& r = records_[i];
+        Account& account = accounts_[r.owner];
+        if (r.prev_of_owner == kNoRecord) {
+            account.first_order = r.next_of_owner;
+        } else {
+            records_[r.prev_of_owner].next_of_owner = r.next_of_owner;
+        }
+        if (r.next_of_owner != kNoRecord) {
+            records_[r.next_of_owner].prev_of_owner = r.prev_of_owner;
+        }
+        --account.open_orders;
+    }
+
     void release(Index i) noexcept {
         const Record& r = records_[i];
         by_client_.erase(client_key(r.owner, r.user_ref));
         by_ref_.erase(r.ref);
+        unlink_from_owner(i);
         records_.release(i);
     }
 
@@ -218,8 +329,19 @@ private:
             reject(owner, m.user_ref, WireRejectReason::InvalidPrice);
             return;
         }
+        // Pre-trade risk checks. They run before the book sees the order, so a refused
+        // order never trades.
+        const Account& account = accounts_[owner];
+        if (m.qty > account.limits.max_order_qty) {
+            reject(owner, m.user_ref, WireRejectReason::MaxQuantityExceeded);
+            return;
+        }
+        if (account.open_orders >= account.limits.max_open_orders) {
+            reject(owner, m.user_ref, WireRejectReason::MaxOpenOrdersExceeded);
+            return;
+        }
         const Index i = records_.acquire();
-        if (i == IndexPool<Record>::kNone) {
+        if (i == kNoRecord) {
             reject(owner, m.user_ref, WireRejectReason::Other);
             return;
         }
@@ -233,9 +355,12 @@ private:
                              // The book has not accepted the order yet, so nothing is
                              // open. on_accepted() sets the real quantity.
                              .open = 0,
-                             .executed = 0};
+                             .executed = 0,
+                             .prev_of_owner = kNoRecord,
+                             .next_of_owner = kNoRecord};
         by_client_.insert(client_key(owner, m.user_ref), i);
         by_ref_.insert(ref, i);
+        link_to_owner(i);
         engine_.submit(*symbol, OrderRequest{.id = ref,
                                              .owner = owner,
                                              .side = m.side,
@@ -287,6 +412,11 @@ private:
         const SymbolId symbol = r.symbol;
         if (m.qty <= r.executed) {
             fail_replace(owner, m.user_ref, symbol, ref, WireRejectReason::InvalidQuantity);
+            return;
+        }
+        // A replace does not add a live order, so only the size limit applies.
+        if (m.qty > accounts_[owner].limits.max_order_qty) {
+            fail_replace(owner, m.user_ref, symbol, ref, WireRejectReason::MaxQuantityExceeded);
             return;
         }
         pending_ = PendingCall{.kind = PendingCall::Kind::Replace, .new_user_ref = m.user_ref};
@@ -371,10 +501,14 @@ private:
         Record& r = records_[i];
         r.open = e.remaining_qty;
         const OwnerId owner = r.owner;
-        const CanceledMessage m{.timestamp = now_,
-                                .user_ref = r.user_ref,
-                                .qty = e.canceled_qty,
-                                .reason = wire_reason(e.reason)};
+        // A cancel from cancel_all() reaches the book as an ordinary cancel, so the book
+        // calls it user requested. The client did not ask for it, so it is reported as a
+        // system cancel instead.
+        const WireCancelReason reason = pending_.kind == PendingCall::Kind::CancelAll
+                                            ? WireCancelReason::System
+                                            : wire_reason(e.reason);
+        const CanceledMessage m{
+            .timestamp = now_, .user_ref = r.user_ref, .qty = e.canceled_qty, .reason = reason};
         if (e.remaining_qty == 0) {
             release(i);
         }
@@ -390,7 +524,8 @@ private:
         const Qty old_open = r.open;
         r.open = e.qty;
         r.price = e.price;
-        if (pending_.kind == PendingCall::Kind::None) {
+        if (pending_.kind == PendingCall::Kind::None ||
+            pending_.kind == PendingCall::Kind::CancelAll) {
             return;
         }
         if (pending_.kind == PendingCall::Kind::Reduce) {
@@ -459,9 +594,9 @@ private:
     OrderEntryConfig config_;
     Engine<Book> engine_;
     IndexPool<Record> records_;
-    FlatIdMap by_client_;                    // client_key(owner, UserRefNum) to record index.
-    FlatIdMap by_ref_;                       // Order Reference Number to record index.
-    std::vector<UserRefNum> last_user_ref_;  // Indexed by owner. Slot 0 is unused.
+    FlatIdMap by_client_;            // client_key(owner, UserRefNum) to record index.
+    FlatIdMap by_ref_;               // Order Reference Number to record index.
+    std::vector<Account> accounts_;  // Indexed by owner. Slot 0 is unused.
     OrderEntryStats stats_;
     OrderRef last_order_ref_ = 0;
     Timestamp now_ = 0;

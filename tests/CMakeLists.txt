@@ -15,6 +15,11 @@ add_executable(litbook_tests
     book/differential_test.cpp
     engine/engine_test.cpp
     engine/ticker_test.cpp
+    gateway/byte_buffer_test.cpp
+    gateway/epoll_gateway_test.cpp
+    gateway/session_manager_test.cpp
+    gateway/session_test.cpp
+    gateway/soup_test.cpp
     itch/binary_file_reader_test.cpp
     itch/book_builder_test.cpp
     itch/itch_parser_test.cpp

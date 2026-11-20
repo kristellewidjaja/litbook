@@ -142,6 +142,12 @@ protected:
             resting += entry_.engine().book(static_cast<SymbolId>(s))->order_count();
         }
         EXPECT_EQ(entry_.live_orders(), resting);
+        // Every live order is on exactly one account's list.
+        std::size_t listed = 0;
+        for (OwnerId owner = 1; owner <= 4; ++owner) {
+            listed += entry_.open_orders(owner);
+        }
+        EXPECT_EQ(listed, resting);
         if (full_check) {
             EXPECT_TRUE(entry_.engine().check_invariants());
         }
@@ -479,6 +485,127 @@ TYPED_TEST(OrderEntryTest, NoRoomForAnotherLiveOrderIsRejected) {
     EXPECT_EQ(sink.take().size(), 2U);
 }
 
+// Pre-trade risk checks.
+
+TYPED_TEST(OrderEntryTest, RiskLimitsDefaultToNoLimit) {
+    EXPECT_EQ(this->entry_.risk_limits(1), RiskLimits{});
+    EXPECT_THROW(this->entry_.set_risk_limits(0, RiskLimits{}), std::out_of_range);
+    EXPECT_THROW(this->entry_.set_risk_limits(5, RiskLimits{}), std::out_of_range);
+    EXPECT_THROW((void)this->entry_.open_orders(5), std::out_of_range);
+}
+
+TYPED_TEST(OrderEntryTest, OrderAboveMaxQuantityIsRejected) {
+    this->entry_.set_risk_limits(1, RiskLimits{.max_order_qty = 100});
+    this->in(1, enter(1, Side::Buy, 101, 500'000));
+    EXPECT_EQ(this->sink_.take(),
+              (std::vector<Sent>{rejected(1, 1, WireRejectReason::MaxQuantityExceeded)}));
+    EXPECT_EQ(this->entry_.live_orders(), 0U);
+    // The limit itself is allowed, and the refused order used up its UserRefNum.
+    const EnterOrder ok = enter(2, Side::Buy, 100, 500'000);
+    this->in(1, ok);
+    EXPECT_EQ(this->sink_.take(), (std::vector<Sent>{accepted(1, ok, 1)}));
+    EXPECT_EQ(this->entry_.last_user_ref(1), 2U);
+    // Another account has its own limits.
+    const EnterOrder big = enter(1, Side::Buy, 5'000, 490'000);
+    this->in(2, big);
+    EXPECT_EQ(this->sink_.take(), (std::vector<Sent>{accepted(2, big, 2)}));
+    this->expect_consistent();
+}
+
+TYPED_TEST(OrderEntryTest, MaxOpenOrdersCountsOnlyLiveOrders) {
+    this->entry_.set_risk_limits(1, RiskLimits{.max_open_orders = 2});
+    this->in(1, enter(1, Side::Buy, 10, 500'000));
+    this->in(1, enter(2, Side::Buy, 100, 490'000, "MSFT"));  // MSFT trades in lots of 100.
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.open_orders(1), 2U);
+    this->in(1, enter(3, Side::Buy, 10, 480'000));
+    EXPECT_EQ(this->sink_.take(),
+              (std::vector<Sent>{rejected(1, 3, WireRejectReason::MaxOpenOrdersExceeded)}));
+    // A canceled order frees its place.
+    this->in(1, CancelOrder{.user_ref = 1, .qty = 0});
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.open_orders(1), 1U);
+    this->in(1, enter(4, Side::Sell, 10, 600'000));
+    EXPECT_EQ(this->sink_.take().size(), 1U);
+    EXPECT_EQ(this->entry_.open_orders(1), 2U);
+    // An order that is filled completely also frees its place.
+    this->in(2, enter(1, Side::Buy, 10, 600'000));
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.open_orders(1), 1U);
+    EXPECT_EQ(this->entry_.open_orders(2), 0U);
+    this->expect_consistent();
+}
+
+TYPED_TEST(OrderEntryTest, ImmediateOrCancelDoesNotStayCountedAsOpen) {
+    this->entry_.set_risk_limits(1, RiskLimits{.max_open_orders = 1});
+    EnterOrder ioc = enter(1, Side::Buy, 10, 500'000);
+    ioc.tif = TimeInForce::ImmediateOrCancel;
+    this->in(1, ioc);
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.open_orders(1), 0U);
+    const EnterOrder rest = enter(2, Side::Buy, 10, 500'000);
+    this->in(1, rest);
+    EXPECT_EQ(this->sink_.take(), (std::vector<Sent>{accepted(1, rest, 2)}));
+}
+
+TYPED_TEST(OrderEntryTest, ReplaceAboveMaxQuantityFailsAndCancelsTheOriginal) {
+    this->entry_.set_risk_limits(1, RiskLimits{.max_order_qty = 100});
+    this->in(1, enter(1, Side::Buy, 100, 500'000));
+    this->sink_.take();
+    this->in(1, ReplaceOrder{.orig_user_ref = 1, .user_ref = 2, .qty = 101, .price = 500'000});
+    EXPECT_EQ(this->sink_.take(),
+              (std::vector<Sent>{rejected(1, 2, WireRejectReason::MaxQuantityExceeded),
+                                 canceled(1, 1, 100, WireCancelReason::UserRequested)}));
+    EXPECT_EQ(this->entry_.open_orders(1), 0U);
+    this->expect_consistent();
+}
+
+// Cancel on disconnect.
+
+TYPED_TEST(OrderEntryTest, CancelAllCancelsOnlyThatAccountsOrders) {
+    this->in(1, enter(1, Side::Buy, 10, 500'000));
+    this->in(1, enter(2, Side::Buy, 100, 490'000, "MSFT"));
+    this->in(1, enter(3, Side::Sell, 10, 600'000));
+    this->in(2, enter(1, Side::Buy, 10, 480'000));
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.cancel_all(1, 55), 3U);
+    // The list is newest first, so the orders are canceled in that order.
+    auto system_cancel = [](UserRefNum ref, Qty qty) {
+        Sent s = canceled(1, ref, qty, WireCancelReason::System);
+        std::get<CanceledMessage>(s.message).timestamp = 55;
+        return s;
+    };
+    EXPECT_EQ(this->sink_.take(), (std::vector<Sent>{system_cancel(3, 10), system_cancel(2, 100),
+                                                     system_cancel(1, 10)}));
+    EXPECT_EQ(this->entry_.open_orders(1), 0U);
+    EXPECT_EQ(this->entry_.open_orders(2), 1U);
+    EXPECT_EQ(this->entry_.live_orders(), 1U);
+    this->expect_consistent();
+    // Nothing is left, so a second call does nothing.
+    EXPECT_EQ(this->entry_.cancel_all(1, 56), 0U);
+    EXPECT_TRUE(this->sink_.take().empty());
+    // Ordinary cancels are user requested again afterwards.
+    this->in(2, CancelOrder{.user_ref = 1, .qty = 0});
+    EXPECT_EQ(this->sink_.take(),
+              (std::vector<Sent>{canceled(2, 1, 10, WireCancelReason::UserRequested)}));
+}
+
+TYPED_TEST(OrderEntryTest, CancelAllCancelsOnlyTheOpenShares) {
+    this->in(1, enter(1, Side::Sell, 100, 500'000));
+    this->in(2, enter(1, Side::Buy, 30, 500'000));
+    this->sink_.take();
+    EXPECT_EQ(this->entry_.cancel_all(1, kNow), 1U);
+    EXPECT_EQ(this->sink_.take(),
+              (std::vector<Sent>{canceled(1, 1, 70, WireCancelReason::System)}));
+    this->expect_consistent();
+}
+
+TYPED_TEST(OrderEntryTest, CancelAllWithBadOwnerIsCounted) {
+    EXPECT_EQ(this->entry_.cancel_all(0, kNow), 0U);
+    EXPECT_EQ(this->entry_.cancel_all(5, kNow), 0U);
+    EXPECT_EQ(this->entry_.stats().bad_owner, 2U);
+}
+
 TYPED_TEST(OrderEntryTest, ConstructorRejectsBadConfig) {
     RecordingSink sink;
     using Entry = OrderEntry<TypeParam>;
@@ -586,18 +713,37 @@ private:
 // (RecordingSink checks that). The counts at the end prove the stream really exercised
 // trades, replaces and the silent-ignore rules.
 TYPED_TEST(OrderEntryTest, RandomStreamKeepsRecordsAndBooksInStep) {
+    // Account 3 has a small size limit and account 4 a small open order limit, so both
+    // risk checks are reached.
+    this->entry_.set_risk_limits(3, RiskLimits{.max_order_qty = 300});
+    this->entry_.set_risk_limits(4, RiskLimits{.max_open_orders = 5});
     RandomClients clients(20261119);
     std::size_t executions = 0;
     std::size_t replaces = 0;
+    std::size_t risk_rejects = 0;
+    std::size_t mass_cancels = 0;
     for (int step = 0; step < 20'000; ++step) {
         const auto [owner, message] = clients.next();
         this->in(owner, message);
+        // Every 500 steps one account loses its connection and asked for cancel on
+        // disconnect.
+        if (step % 500 == 499) {
+            const auto gone = static_cast<OwnerId>(1 + (step / 500) % 4);
+            mass_cancels += this->entry_.cancel_all(gone, kNow);
+            EXPECT_EQ(this->entry_.open_orders(gone), 0U);
+        }
         for (const Sent& s : this->sink_.take()) {
             if (std::holds_alternative<ExecutedMessage>(s.message)) {
                 ++executions;
             }
             if (std::holds_alternative<ReplacedMessage>(s.message)) {
                 ++replaces;
+            }
+            if (const auto* j = std::get_if<RejectedMessage>(&s.message)) {
+                if (j->reason == WireRejectReason::MaxQuantityExceeded ||
+                    j->reason == WireRejectReason::MaxOpenOrdersExceeded) {
+                    ++risk_rejects;
+                }
             }
         }
         // The book invariant check scans the whole ladder, so it runs every 100 steps.
@@ -606,6 +752,8 @@ TYPED_TEST(OrderEntryTest, RandomStreamKeepsRecordsAndBooksInStep) {
     }
     EXPECT_GT(executions, 100U);
     EXPECT_GT(replaces, 100U);
+    EXPECT_GT(risk_rejects, 100U);
+    EXPECT_GT(mass_cancels, 10U);
     EXPECT_GT(this->entry_.stats().stale_user_ref, 0U);
     EXPECT_GT(this->entry_.stats().unknown_order, 0U);
 }

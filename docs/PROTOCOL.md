@@ -2,13 +2,48 @@
 
 This is the binary protocol clients use to enter, replace and cancel orders, and that the exchange uses to report what happened to them. It is modeled on Nasdaq OUCH 5.0 (specification revision of October 2026). It keeps OUCH's message type letters, field names, field encodings, byte order and session rules, and drops the fields and options that litbook does not implement. Every difference is listed in [Differences from OUCH 5.0](#differences-from-ouch-50).
 
-The codec lives in `include/litbook/protocol/codec.hpp` and `src/protocol/codec.cpp`. The session rules are implemented by the order entry layer in `include/litbook/protocol/order_entry.hpp`.
+The codec lives in `include/litbook/protocol/codec.hpp` and `src/protocol/codec.cpp`. The session rules are implemented by the order entry layer in `include/litbook/protocol/order_entry.hpp`. The transport is SoupBinTCP 3.0, implemented in `include/litbook/gateway/soup.hpp` and `include/litbook/gateway/session_manager.hpp`.
 
-## Transport and framing
+## Transport: SoupBinTCP 3.0
 
-Each message is carried in one frame, and the transport says where a frame starts and ends. In Phase 6 that is a 2-byte big-endian length prefix in front of each message, in the style of SoupBinTCP. The codec only ever sees one whole frame.
+Messages travel over TCP inside SoupBinTCP 3.0 packets, as OUCH does at Nasdaq. This section follows Nasdaq's SoupBinTCP specification (version 3.00) and marks every rule litbook adds where the specification leaves a choice open.
 
-Every message has a fixed length. A frame whose length is not exactly the length of its message type is malformed.
+### Packets
+
+Every packet starts with a 2-byte big-endian Packet Length that counts the bytes after it, which are a 1-byte Packet Type and then the payload. TCP may split a packet across reads or join several packets in one read, so the receiver collects bytes until a whole packet is there.
+
+| Type | Sent by | Payload |
+|---|---|---|
+| `+` Debug | either side | Free text. The receiver ignores it. |
+| `L` Login Request | client | Username (6, padded on the right with spaces), Password (10, padded on the right), Requested Session (10, all spaces for the current session), Requested Sequence Number (20, ASCII digits). 46 bytes. |
+| `A` Login Accepted | server | Session (10, padded on the left with spaces), Sequence Number (20, ASCII digits padded on the left), the number the next Sequenced Data packet will have. 30 bytes. |
+| `J` Login Rejected | server | Reject Reason Code (1). `A` not authorized, `S` session not available. |
+| `U` Unsequenced Data | client | One inbound order entry message. |
+| `S` Sequenced Data | server | One outbound order entry message. |
+| `R` Client Heartbeat | client | None. |
+| `H` Server Heartbeat | server | None. |
+| `O` Logout Request | client | None. |
+| `Z` End of Session | server | None. |
+
+The order entry message inside a Unsequenced Data or Sequenced Data packet is exactly one message, so the codec only ever sees one whole frame. Every message has a fixed length, and a frame whose length is not exactly the length of its message type is malformed.
+
+### Sequence numbers
+
+Sequence numbers are never sent inside Sequenced Data packets. Both sides count them, starting at 1 for each account's first sequenced message of the session. litbook keeps one sequence per account, and it continues across connections. Every outbound message produced for an account uses up the next number, even when the account has no connection that can take the message (for example the cancels sent by cancel on disconnect). Such a message is lost for now, because replaying old messages needs the journal of Phase 9.
+
+### Session rules of the litbook gateway
+
+1. **Login first.** The first packet on a new connection must be a Login Request. Debug packets are ignored at any time. Any other packet before a successful login closes the connection.
+2. **Accounts.** Username and password are compared without regard to case. An unknown username or a wrong password gets Login Rejected `A`, and the connection is closed.
+3. **When a login is refused with `S`.** The session has ended, or the requested session is not blank and not the current one, or the account is already logged in on another connection (litbook allows one connection per account), or the requested sequence number is above 0 and below the account's next number (replaying old messages is not supported until Phase 9). The connection is closed after Login Rejected.
+4. **Sequence number ahead.** A requested sequence number above the account's next number is accepted, and Login Accepted tells the client the real next number. The specification says this case is handled but does not say how, so this is litbook's choice.
+5. **Packet length limit.** The specification sets no maximum length. litbook closes a connection whose Packet Length is 0 or above 47 (the size of a Login Request, the largest packet a client needs), as soon as the two length bytes arrive. A long Debug packet therefore also closes the connection.
+6. **Malformed input.** A Login Request with the wrong length or a sequence field that is not a number, a second Login Request on a logged in connection, a packet type that a client may not send, and an order entry message that does not decode all close the connection with no reply.
+7. **Heartbeats and timeouts.** The server sends a Server Heartbeat to a logged in client when it sent nothing else for 1 second. A logged in client that sends nothing for 15 seconds is disconnected, and so is a connection that has not logged in after 30 seconds. The three times are configurable.
+8. **Logout.** A Logout Request closes the connection at once.
+9. **Backpressure and slow clients.** If a client does not read its replies, the server stops processing that client's input once 32 KiB of replies are waiting (configurable), and TCP flow control then slows the client down. Messages that cannot be held back, such as executions caused by other accounts' orders, still go into the client's 64 KiB output buffer. A client whose output buffer fills up is disconnected.
+10. **Cancel on disconnect.** An account can be configured to have all of its live orders canceled when its connection goes away for any reason. Each order gets Order Canceled with reason `Z`, which uses up sequence numbers as described above.
+11. **End of session.** When the exchange ends the session, every logged in client gets End of Session and every connection is closed. Later logins get Login Rejected `S`.
 
 ## Data types
 
@@ -136,7 +171,7 @@ These are OUCH's letters.
 | `U` | User requested. The answer to a Cancel Order. |
 | `I` | Immediate or cancel. The part of an IOC, FOK or market order that could not trade on arrival. |
 | `Q` | Self match prevention. The order would have traded with an order from the same account. |
-| `Z` | System. The exchange removed it because the book had no room left for another resting order. |
+| `Z` | System. The exchange removed it, because the book had no room left for another resting order or because the account's connection went away and the account asked for cancel on disconnect. |
 
 ### Reject reasons
 
@@ -148,8 +183,10 @@ Codes below 0x0100 are OUCH's own codes. Codes from 0x0100 up are litbook extens
 | 0x0013 | Invalid quantity (zero, or not a multiple of the lot size). |
 | 0x0017 | Invalid symbol (the stock is not listed). |
 | 0x001D | Invalid price (off the tick, or outside the stock's price band). |
+| 0x0031 | Risk: Max Quantity Exceeded (the Quantity is above the account's limit). |
 | 0x0101 | Post only would cross (a post-only order would trade on arrival). |
 | 0x0102 | Invalid order type (the fields contradict each other, such as a post-only market order). |
+| 0x0103 | Max open orders exceeded (the account already has its limit of live orders). OUCH has no code for this limit. |
 
 ## Malformed versus rejected
 
@@ -165,12 +202,12 @@ In inbound messages every enumerated field is checked strictly. In outbound mess
 
 These rules belong to the order entry layer, not the codec.
 
-1. **Accounts.** Each client account (litbook's `OwnerId`) has its own UserRefNum sequence. In Phase 6 the account is the session the message arrived on.
+1. **Accounts.** Each client account (litbook's `OwnerId`) has its own UserRefNum sequence. The account is the one the connection logged in as.
 2. **UserRefNum.** An Enter Order or Replace Order whose new UserRefNum is not higher than the last one that account used is silently ignored, as in OUCH, because it is treated as a retransmission. This includes 0, since numbering starts at 1. A UserRefNum is used up once a message with it is processed, whether the order was accepted or rejected.
-3. **Enter Order.** An unlisted symbol gets Rejected (0x0017). Otherwise the order goes to the stock's book. A rule violation gets Rejected, and an accepted order gets Order Accepted with a fresh Order Reference Number. Executions and cancels that happen on arrival follow the Accepted message.
+3. **Enter Order.** An unlisted symbol gets Rejected (0x0017). Then come the account's pre-trade risk checks. A Quantity above its limit gets Rejected (0x0031), and so does an order that would give the account more live orders than its limit (0x0103). Otherwise the order goes to the stock's book. A rule violation gets Rejected, and an accepted order gets Order Accepted with a fresh Order Reference Number. Executions and cancels that happen on arrival follow the Accepted message.
 4. **Executions.** Both sides of a trade get Order Executed with the same Match Number. The resting side's Liquidity Flag is `A` and the incoming side's is `R`.
 5. **Cancel Order.** A Cancel for a UserRefNum that is not a live order of that account is silently ignored, as in OUCH. Otherwise the open quantity becomes the intended size minus the shares already executed (never below 0). If that is 0 the order is canceled. If it is smaller than the current open quantity the order shrinks in place and keeps its priority. An intended size that would not reduce the order is ignored. The answer is Order Canceled with the number of shares taken off.
-6. **Replace Order.** A Replace whose OrigUserRefNum is not a live order of that account, or whose new UserRefNum breaks rule 2, is silently ignored. Otherwise the new open quantity is the Quantity field minus the shares already executed. If that would be 0 or less, or the book refuses the new price or size, the replace fails. A failed replace gets Rejected for the new UserRefNum, and then the original order is canceled with Order Canceled (reason `U`), as OUCH does with an invalid replace. A successful replace gets Order Replaced and the order is known by its new UserRefNum from then on. The order keeps its priority only if the price is unchanged and the size does not grow (D-021). Otherwise it goes to the back of the queue and may trade at once, and those executions carry the new UserRefNum.
+6. **Replace Order.** A Replace whose OrigUserRefNum is not a live order of that account, or whose new UserRefNum breaks rule 2, is silently ignored. Otherwise the new open quantity is the Quantity field minus the shares already executed. If that would be 0 or less, if the Quantity field is above the account's size limit (0x0031), or if the book refuses the new price or size, the replace fails. A failed replace gets Rejected for the new UserRefNum, and then the original order is canceled with Order Canceled (reason `U`), as OUCH does with an invalid replace. A successful replace gets Order Replaced and the order is known by its new UserRefNum from then on. The order keeps its priority only if the price is unchanged and the size does not grow (D-021). Otherwise it goes to the back of the queue and may trade at once, and those executions carry the new UserRefNum.
 7. **Timestamps.** The caller of the order entry layer supplies the timestamp of each inbound message, and every outbound message caused by it carries that time. Replaying the same inputs with the same timestamps therefore gives the same output, byte for byte, which the journal in Phase 9 relies on.
 
 ## Differences from OUCH 5.0
@@ -188,4 +225,5 @@ These rules belong to the order entry layer, not the codec.
 | Order Replaced | Has its own Order Reference Number layout and no priority field. Priority changes are reported in a separate Order Priority Update message. | Has a Priority Kept byte. |
 | Invalid replace | The original order is canceled. | The same, and a Rejected message for the new UserRefNum comes first, so the client learns why. |
 | Reject reasons | OUCH codes. | The OUCH codes listed above plus extensions from 0x0100. |
+| Session layer | SoupBinTCP 3.0. A client can log in again with an older sequence number and get every message it missed. | SoupBinTCP 3.0 with the limits in [the gateway's session rules](#session-rules-of-the-litbook-gateway). Missed messages cannot be requested again until the Phase 9 journal. |
 | Other messages | Modify Order, Mass Cancel, Disable and Enable Order Entry, Account Query, System Event, Broken Trade, Cancel Pending, Cancel Reject, AIQ Canceled, Order Priority Update, Order Modified, Order Restated and others. | Not implemented. |

@@ -14,6 +14,9 @@
 #include "litbook/book/sorted_order_book.hpp"
 #include "litbook/engine/engine.hpp"
 #include "litbook/engine/engine_listener.hpp"
+#include "litbook/gateway/epoll_gateway.hpp"
+#include "litbook/gateway/session_manager.hpp"
+#include "litbook/gateway/soup.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
 #include <gtest/gtest.h>
@@ -26,11 +29,13 @@
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "book/book_test_support.hpp"
 #include "book/workload.hpp"
+#include "gateway/test_client.hpp"
 #include "protocol/order_entry_stream.hpp"
 #include "support/unwrap.hpp"
 
@@ -337,6 +342,192 @@ TEST(NoAllocationTest, OrderEntryOverFastBooksNeverAllocates) {
 
 TEST(NoAllocationTest, OrderEntryOverSortedBooksNeverAllocates) {
     expect_order_entry_never_allocates<SortedOrderBook>();
+}
+
+// The SoupBinTCP session layer in front of order entry must not allocate either, for
+// logins, cut up packets, replies, heartbeats, disconnects with cancel on disconnect, and
+// reconnects. The stream's malformed frames close their connection, and the test then
+// reconnects and logs in again, so those paths run inside the counted region too.
+template <class Book>
+void expect_sessions_never_allocate() {
+    using Manager = gateway::SessionManager<Book>;
+    using ConnectionId = typename Manager::ConnectionId;
+    constexpr OwnerId kOwners = 4;
+    const std::array<std::string_view, kOwners + 1> users{"", "ann", "ben", "cy", "dee"};
+
+    // Every packet is built before the counter is armed.
+    const auto stream = testing::order_entry_stream(11, 50'000);
+    std::vector<std::vector<std::byte>> packets;
+    packets.reserve(stream.size());
+    for (const testing::InboundFrame& frame : stream) {
+        std::vector<std::byte> packet(gateway::soup::kHeaderSize + frame.bytes.size());
+        (void)gateway::soup::encode_packet(gateway::soup::PacketType::UnsequencedData, frame.bytes,
+                                           packet);
+        packets.push_back(std::move(packet));
+    }
+    std::array<std::vector<std::byte>, kOwners + 1> logins{};
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        const auto request = gateway::soup::make_login_request(users.at(owner), "pw", "", 0);
+        logins.at(owner).resize(gateway::soup::kHeaderSize + gateway::soup::kLoginRequestPayload);
+        (void)gateway::soup::encode_login_request(testing::unwrap(request), logins.at(owner));
+    }
+
+    Manager m(gateway::SessionConfig{.max_connections = 8},
+              {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2});
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        m.add_account({.username = users.at(owner),
+                       .password = "pw",
+                       .cancel_on_disconnect = owner % 2 == 1});
+    }
+    for (const char* name : testing::kStreamStocks) {
+        m.add_symbol(testing::unwrap(make_ticker(name)),
+                     testing::with_test_limits(BookConfig{.tick_size = 100}));
+    }
+
+    std::array<ConnectionId, kOwners + 1> ids{};
+    std::uint64_t reconnects = 0;
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        gateway::Timestamp now = 0;
+        // Opens a connection for `owner`, logs it in and writes out the reply.
+        auto connect = [&](OwnerId owner) {
+            const ConnectionId id = m.open(now);
+            ids.at(owner) = id;
+            (void)m.receive(id, logins.at(owner), now);
+            m.sent(id, m.output(id).size(), now);
+        };
+        for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+            connect(owner);
+        }
+        for (std::size_t i = 0; i < stream.size(); ++i) {
+            now += 1'000;
+            const OwnerId owner = stream[i].owner;
+            const ConnectionId id = ids.at(owner);
+            // Deliver each packet in two pieces, cut at a different place every time.
+            const std::span<const std::byte> packet(packets[i]);
+            const std::size_t cut = i % packet.size();
+            (void)m.receive(id, packet.first(cut), now);
+            (void)m.receive(id, packet.subspan(cut), now);
+            for (OwnerId o = 1; o <= kOwners; ++o) {
+                const ConnectionId c = ids.at(o);
+                m.sent(c, m.output(c).size(), now);
+            }
+            if (m.should_close(id)) {
+                m.close(id, gateway::CloseReason::PeerClosed, now);
+                connect(owner);
+                ++reconnects;
+            }
+            if (i % 100 == 0) {
+                m.tick(now);
+            }
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_GT(reconnects, 100U);
+    EXPECT_EQ(m.stats().logins_accepted, kOwners + reconnects);
+    EXPECT_GT(m.stats().messages_out, 50'000U);
+    EXPECT_GT(m.order_entry().engine().last_match_id(), 1'000U);
+    EXPECT_TRUE(m.order_entry().engine().check_invariants());
+}
+
+TEST(NoAllocationTest, SessionsOverFastBooksNeverAllocate) {
+    expect_sessions_never_allocate<FastOrderBook>();
+}
+
+TEST(NoAllocationTest, SessionsOverSortedBooksNeverAllocate) {
+    expect_sessions_never_allocate<SortedOrderBook>();
+}
+
+// The epoll gateway serving real loopback sockets must not allocate either. The clients
+// connect before the counter is armed. Malformed frames are left out of the stream,
+// because they end the connection and making a new test client allocates its buffer (the
+// session layer test above covers reconnects).
+TEST(NoAllocationTest, EpollGatewayNeverAllocatesWhileServing) {
+    using Manager = gateway::SessionManager<SortedOrderBook>;
+    constexpr OwnerId kOwners = 4;
+    const std::array<std::string_view, kOwners + 1> users{"", "ann", "ben", "cy", "dee"};
+
+    const auto stream = testing::order_entry_stream(13, 20'000);
+    std::vector<std::vector<std::byte>> packets;
+    std::vector<OwnerId> owners;
+    for (const testing::InboundFrame& frame : stream) {
+        if (protocol::decode_inbound(frame.bytes).status != protocol::DecodeStatus::Ok) {
+            continue;
+        }
+        std::vector<std::byte> packet(gateway::soup::kHeaderSize + frame.bytes.size());
+        (void)gateway::soup::encode_packet(gateway::soup::PacketType::UnsequencedData, frame.bytes,
+                                           packet);
+        packets.push_back(std::move(packet));
+        owners.push_back(frame.owner);
+    }
+    std::array<std::vector<std::byte>, kOwners + 1> logins{};
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        const auto request = gateway::soup::make_login_request(users.at(owner), "pw", "", 0);
+        logins.at(owner).resize(gateway::soup::kHeaderSize + gateway::soup::kLoginRequestPayload);
+        (void)gateway::soup::encode_login_request(testing::unwrap(request), logins.at(owner));
+    }
+
+    Manager m(gateway::SessionConfig{.max_connections = 8},
+              {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2});
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        m.add_account({.username = users.at(owner), .password = "pw"});
+    }
+    for (const char* name : testing::kStreamStocks) {
+        m.add_symbol(testing::unwrap(make_ticker(name)),
+                     testing::with_test_limits(BookConfig{.tick_size = 100}));
+    }
+    gateway::EpollGateway<SortedOrderBook> gw(m, gateway::GatewayConfig{});
+    // One client per account, indexed by owner. Slot 0 is a connection that never logs in,
+    // which also checks that an idle connection costs nothing.
+    std::vector<std::unique_ptr<gateway::testing::TestClient>> clients;
+    for (OwnerId owner = 0; owner <= kOwners; ++owner) {
+        clients.push_back(std::make_unique<gateway::testing::TestClient>(gw.port()));
+    }
+    std::uint64_t replies = 0;
+    // Reads every client's replies and counts the packets.
+    auto drain = [&] {
+        for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+            auto& c = *clients.at(owner);
+            c.read_available();
+            while (c.next_packet().status == gateway::soup::PacketStatus::Complete) {
+                ++replies;
+            }
+        }
+    };
+
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+            (void)clients.at(owner)->send_some(logins.at(owner));
+        }
+        for (std::size_t i = 0; i < packets.size(); ++i) {
+            auto& c = *clients.at(owners[i]);
+            std::span<const std::byte> rest(packets[i]);
+            while (!rest.empty()) {
+                rest = rest.subspan(c.send_some(rest));
+                (void)gw.poll_once(0);
+                drain();
+            }
+        }
+        // Let the last replies arrive.
+        for (int round = 0; round < 200 && m.order_entry().stats().malformed == 0; ++round) {
+            (void)gw.poll_once(1);
+            drain();
+            if (replies >= kOwners + m.stats().messages_out) {
+                break;
+            }
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(gw.open_sockets(), kOwners + 1);
+    EXPECT_EQ(m.stats().logins_accepted, kOwners);
+    EXPECT_EQ(replies, kOwners + m.stats().messages_out);  // Logins plus every reply.
+    EXPECT_GT(m.stats().messages_out, 15'000U);
+    EXPECT_GT(m.order_entry().engine().last_match_id(), 500U);
 }
 
 }  // namespace

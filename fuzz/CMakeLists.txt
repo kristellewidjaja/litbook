@@ -2,6 +2,7 @@
 # litbook::fuzz::run_one (see fuzz_target.hpp).
 #   book_fuzzer      differential test of all three books against the naive oracle
 #   protocol_fuzzer  decoder robustness and canonical re-encoding of the wire codec
+#   session_fuzzer   the SoupBinTCP session layer fed random bytes, splits and timing
 # With the `fuzz` preset (Clang only) each target gets a libFuzzer executable. In every
 # other preset a replay executable runs the saved inputs in its seeds and regressions
 # folders as a normal test.
@@ -16,6 +17,13 @@ target_include_directories(litbook_protocol_fuzz_target PUBLIC ${CMAKE_CURRENT_S
 target_link_libraries(litbook_protocol_fuzz_target
     PUBLIC litbook::litbook PRIVATE litbook::warnings)
 
+add_library(litbook_session_fuzz_target STATIC session_fuzzer.cpp)
+target_include_directories(litbook_session_fuzz_target
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/tests)  # for the test book limits
+target_link_libraries(litbook_session_fuzz_target
+    PUBLIC litbook::litbook PRIVATE litbook::warnings)
+
 if(LITBOOK_FUZZ)
     add_executable(book_fuzzer libfuzzer_main.cpp)
     target_link_libraries(book_fuzzer PRIVATE litbook_fuzz_target litbook::warnings)
@@ -24,6 +32,10 @@ if(LITBOOK_FUZZ)
     add_executable(protocol_fuzzer libfuzzer_main.cpp)
     target_link_libraries(protocol_fuzzer PRIVATE litbook_protocol_fuzz_target litbook::warnings)
     target_link_options(protocol_fuzzer PRIVATE -fsanitize=fuzzer)
+
+    add_executable(session_fuzzer libfuzzer_main.cpp)
+    target_link_libraries(session_fuzzer PRIVATE litbook_session_fuzz_target litbook::warnings)
+    target_link_options(session_fuzzer PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(LITBOOK_BUILD_TESTS)
@@ -43,4 +55,13 @@ if(LITBOOK_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/protocol_seeds
             ${CMAKE_CURRENT_SOURCE_DIR}/protocol_regressions)
     set_tests_properties(ProtocolFuzzCorpusReplay PROPERTIES TIMEOUT 300)
+
+    add_executable(litbook_session_fuzz_replay replay_main.cpp)
+    target_link_libraries(litbook_session_fuzz_replay
+        PRIVATE litbook_session_fuzz_target litbook::warnings)
+    add_test(NAME SessionFuzzCorpusReplay
+        COMMAND litbook_session_fuzz_replay
+            ${CMAKE_CURRENT_SOURCE_DIR}/session_seeds
+            ${CMAKE_CURRENT_SOURCE_DIR}/session_regressions)
+    set_tests_properties(SessionFuzzCorpusReplay PROPERTIES TIMEOUT 300)
 endif()
