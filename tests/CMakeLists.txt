@@ -13,10 +13,15 @@ add_executable(litbook_tests
     book/fast_order_book_test.cpp
     book/sorted_order_book_test.cpp
     book/differential_test.cpp
+    engine/engine_test.cpp
+    engine/ticker_test.cpp
     itch/binary_file_reader_test.cpp
     itch/book_builder_test.cpp
     itch/itch_parser_test.cpp
     metrics/latency_histogram_test.cpp
+    protocol/byte_order_test.cpp
+    protocol/codec_test.cpp
+    protocol/order_entry_test.cpp
     metrics/tick_clock_test.cpp)
 
 target_include_directories(litbook_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

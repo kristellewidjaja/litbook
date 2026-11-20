@@ -1,0 +1,471 @@
+#pragma once
+
+#include "litbook/book/order_book.hpp"
+#include "litbook/container/flat_id_map.hpp"
+#include "litbook/container/index_pool.hpp"
+#include "litbook/engine/engine.hpp"
+#include "litbook/engine/engine_listener.hpp"
+#include "litbook/protocol/codec.hpp"
+#include "litbook/protocol/messages.hpp"
+#include "litbook/types.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+#include <variant>
+#include <vector>
+
+namespace litbook::protocol {
+
+// Receives every outbound frame, already encoded, together with the account it is for.
+// In Phase 6 the gateway writes the frame to that account's connection. The frame is only
+// valid during the call.
+class OutboundSink {
+public:
+    virtual ~OutboundSink() = default;
+    virtual void send(OwnerId owner, std::span<const std::byte> frame) = 0;
+
+protected:
+    OutboundSink() = default;
+    OutboundSink(const OutboundSink&) = default;
+    OutboundSink(OutboundSink&&) = default;
+    OutboundSink& operator=(const OutboundSink&) = default;
+    OutboundSink& operator=(OutboundSink&&) = default;
+};
+
+struct OrderEntryConfig {
+    // Accounts are numbered 1 to max_owners. Owner 0 is kNoOwner, which the books exempt
+    // from self-trade prevention, so it is never a real account.
+    OwnerId max_owners = 16;
+    // The most orders that can be live at once across all accounts and stocks.
+    std::uint32_t max_live_orders = 1U << 20U;
+    // The most stocks the engine may list.
+    std::size_t max_symbols = 1024;
+};
+
+// Counts of inbound messages that were dropped without any outbound message. OUCH drops
+// these silently, and the counters make them visible to tests and operators.
+struct OrderEntryStats {
+    std::uint64_t malformed = 0;         // The frame did not decode.
+    std::uint64_t bad_owner = 0;         // The owner was 0 or above max_owners.
+    std::uint64_t stale_user_ref = 0;    // The new UserRefNum was not above the last one.
+    std::uint64_t unknown_order = 0;     // A cancel or replace named no live order.
+    std::uint64_t no_effect_cancel = 0;  // A cancel would not reduce the order.
+    bool operator==(const OrderEntryStats&) const = default;
+};
+
+// The order entry layer. It owns the matching engine, applies the session rules from
+// docs/PROTOCOL.md, and turns engine events into outbound messages for each account.
+//
+// The client knows an order by (account, UserRefNum), and the exchange knows it by its
+// Order Reference Number, which is also the order's ID inside its book. Two flat hash maps
+// connect them to one record per live order, kept in an IndexPool. Everything is
+// allocated in the constructor and in add_symbol, so handling a message never allocates.
+//
+// These invariants hold between calls. Every live order has exactly one record, reachable
+// from both maps, and its open quantity equals the quantity resting in its book. A record
+// is released as soon as its order has no open quantity left. last_user_ref(owner) only
+// grows.
+template <OrderBook Book>
+class OrderEntry final : private EngineListener {
+public:
+    // Throws std::invalid_argument for a zero max_owners or max_live_orders, or a
+    // max_symbols the engine does not support.
+    OrderEntry(OutboundSink& sink, const OrderEntryConfig& config)
+        : sink_(&sink),
+          config_(checked(config)),
+          engine_(*this, config.max_symbols),
+          records_(config.max_live_orders),
+          by_client_(config.max_live_orders),
+          by_ref_(config.max_live_orders),
+          last_user_ref_(static_cast<std::size_t>(config.max_owners) + 1, 0) {}
+
+    OrderEntry(const OrderEntry&) = delete;
+    OrderEntry& operator=(const OrderEntry&) = delete;
+    OrderEntry(OrderEntry&&) = delete;
+    OrderEntry& operator=(OrderEntry&&) = delete;
+    ~OrderEntry() override = default;
+
+    // Lists a stock. This is a startup call, see Engine::add_symbol.
+    SymbolId add_symbol(Ticker ticker, const BookConfig& config) {
+        return engine_.add_symbol(ticker, config);
+    }
+
+    // Decodes one inbound frame from `owner` and handles it. A malformed frame is counted
+    // and its DecodeStatus is returned, and nothing else happens. `now` is the timestamp
+    // put on every outbound message this frame causes.
+    DecodeStatus on_frame(OwnerId owner, std::span<const std::byte> frame, Timestamp now) {
+        const auto decoded = decode_inbound(frame);
+        if (!decoded.message) {
+            ++stats_.malformed;
+            return decoded.status;
+        }
+        handle(owner, *decoded.message, now);
+        return DecodeStatus::Ok;
+    }
+
+    // Handles one inbound message that is already decoded.
+    void handle(OwnerId owner, const InboundMessage& message, Timestamp now) {
+        if (owner == kNoOwner || owner > config_.max_owners) {
+            ++stats_.bad_owner;
+            return;
+        }
+        now_ = now;
+        std::visit([&](const auto& m) { on_message(owner, m); }, message);
+    }
+
+    [[nodiscard]] const Engine<Book>& engine() const noexcept { return engine_; }
+    [[nodiscard]] const OrderEntryStats& stats() const noexcept { return stats_; }
+    [[nodiscard]] std::uint32_t live_orders() const noexcept { return records_.in_use(); }
+    [[nodiscard]] UserRefNum last_user_ref(OwnerId owner) const { return last_user_ref_.at(owner); }
+
+private:
+    // Everything the order entry layer needs to know about one live order.
+    struct Record {
+        OrderRef ref;  // Also the order's ID inside its book.
+        OwnerId owner;
+        UserRefNum user_ref;
+        SymbolId symbol;
+        Side side;
+        Price price;
+        Qty open;      // Shares still resting (or about to rest) in the book.
+        Qty executed;  // Shares executed so far, over the order's whole life.
+    };
+    using Index = IndexPool<Record>::Index;
+
+    // A cancel that shrinks an order and a replace both work by calling the book's
+    // modify(). The book answers through the event handlers below, while modify() is
+    // still running, and a handler is not allowed to call back into the engine. So
+    // before calling modify(), the caller fills in a PendingCall to tell the handlers
+    // what the modify is for, and afterwards it reads back whether the book refused it.
+    //
+    // For example, a Replace from account 1 that renames order 7 to 8 goes like this.
+    // 1. on_message(ReplaceOrder) sets kind = Replace and new_user_ref = 8, then calls
+    //    modify().
+    // 2. If the book accepts the change, on_modified() sees kind == Replace, moves the
+    //    record from UserRefNum 7 to 8 and sends Order Replaced. Any trades that follow
+    //    are then reported under 8.
+    // 3. If the book refuses it, on_modify_rejected() sets refused = true and saves the
+    //    reason. After modify() returns, on_message sees refused, sends Rejected for 8
+    //    and cancels the original order. That cancel is a new call into the engine,
+    //    which is allowed again now that modify() has returned.
+    struct PendingCall {
+        enum class Kind : std::uint8_t { None, Reduce, Replace };
+        Kind kind = Kind::None;
+        UserRefNum new_user_ref = 0;  // Only used by a replace.
+        bool refused = false;         // Set if the book sent ModifyRejected.
+        WireRejectReason reason = WireRejectReason::Other;
+    };
+
+    static OrderEntryConfig checked(const OrderEntryConfig& config) {
+        if (config.max_owners == 0 || config.max_live_orders == 0) {
+            throw std::invalid_argument("OrderEntry needs max_owners and max_live_orders >= 1");
+        }
+        return config;
+    }
+
+    static FlatIdMap::Key client_key(OwnerId owner, UserRefNum user_ref) noexcept {
+        return (static_cast<std::uint64_t>(owner) << 32U) | user_ref;
+    }
+
+    // Applies the UserRefNum rule. Returns false if the message must be ignored.
+    bool take_user_ref(OwnerId owner, UserRefNum user_ref) noexcept {
+        UserRefNum& last = last_user_ref_[owner];
+        if (user_ref <= last) {
+            ++stats_.stale_user_ref;
+            return false;
+        }
+        last = user_ref;
+        return true;
+    }
+
+    Index find_client(OwnerId owner, UserRefNum user_ref) const noexcept {
+        return by_client_.find(client_key(owner, user_ref));
+    }
+
+    void release(Index i) noexcept {
+        const Record& r = records_[i];
+        by_client_.erase(client_key(r.owner, r.user_ref));
+        by_ref_.erase(r.ref);
+        records_.release(i);
+    }
+
+    template <class Message>
+    void send(OwnerId owner, const Message& m) {
+        std::array<std::byte, kMaxMessageLength> buffer{};
+        const std::size_t n = encode(m, buffer);
+        sink_->send(owner, std::span<const std::byte>(buffer.data(), n));
+    }
+
+    void reject(OwnerId owner, UserRefNum user_ref, WireRejectReason reason) {
+        send(owner, RejectedMessage{.timestamp = now_, .user_ref = user_ref, .reason = reason});
+    }
+
+    // Inbound messages.
+
+    void on_message(OwnerId owner, const EnterOrder& m) {
+        if (!take_user_ref(owner, m.user_ref)) {
+            return;
+        }
+        const auto symbol = engine_.find(m.symbol);
+        if (!symbol) {
+            reject(owner, m.user_ref, WireRejectReason::InvalidSymbol);
+            return;
+        }
+        if (m.type == OrderType::Market && m.price != 0) {
+            reject(owner, m.user_ref, WireRejectReason::InvalidPrice);
+            return;
+        }
+        const Index i = records_.acquire();
+        if (i == IndexPool<Record>::kNone) {
+            reject(owner, m.user_ref, WireRejectReason::Other);
+            return;
+        }
+        const OrderRef ref = ++last_order_ref_;
+        records_[i] = Record{.ref = ref,
+                             .owner = owner,
+                             .user_ref = m.user_ref,
+                             .symbol = *symbol,
+                             .side = m.side,
+                             .price = m.price,
+                             // The book has not accepted the order yet, so nothing is
+                             // open. on_accepted() sets the real quantity.
+                             .open = 0,
+                             .executed = 0};
+        by_client_.insert(client_key(owner, m.user_ref), i);
+        by_ref_.insert(ref, i);
+        engine_.submit(*symbol, OrderRequest{.id = ref,
+                                             .owner = owner,
+                                             .side = m.side,
+                                             .type = m.type,
+                                             .tif = m.tif,
+                                             .post_only = m.post_only,
+                                             .price = m.price,
+                                             .qty = m.qty});
+    }
+
+    void on_message(OwnerId owner, const CancelOrder& m) {
+        const Index i = find_client(owner, m.user_ref);
+        if (i == FlatIdMap::kNotFound) {
+            ++stats_.unknown_order;
+            return;
+        }
+        const Record& r = records_[i];
+        const OrderRef ref = r.ref;
+        const Qty target = m.qty > r.executed ? m.qty - r.executed : 0;
+        if (target == 0) {
+            engine_.cancel(r.symbol, ref);  // on_canceled reports it.
+            return;
+        }
+        if (target >= r.open) {
+            ++stats_.no_effect_cancel;
+            return;
+        }
+        pending_ = PendingCall{.kind = PendingCall::Kind::Reduce};
+        engine_.modify(r.symbol, ref, r.price, target);  // on_modified reports it.
+        const bool refused = pending_.refused;
+        pending_ = PendingCall{};
+        if (refused) {
+            // The smaller size is not a multiple of the lot size, so nothing changed.
+            ++stats_.no_effect_cancel;
+        }
+    }
+
+    void on_message(OwnerId owner, const ReplaceOrder& m) {
+        const Index i = find_client(owner, m.orig_user_ref);
+        if (i == FlatIdMap::kNotFound) {
+            ++stats_.unknown_order;
+            return;
+        }
+        if (!take_user_ref(owner, m.user_ref)) {
+            return;
+        }
+        const Record& r = records_[i];
+        const OrderRef ref = r.ref;
+        const SymbolId symbol = r.symbol;
+        if (m.qty <= r.executed) {
+            fail_replace(owner, m.user_ref, symbol, ref, WireRejectReason::InvalidQuantity);
+            return;
+        }
+        pending_ = PendingCall{.kind = PendingCall::Kind::Replace, .new_user_ref = m.user_ref};
+        engine_.modify(symbol, ref, m.price, m.qty - r.executed);
+        const PendingCall done = pending_;
+        pending_ = PendingCall{};
+        if (done.refused) {
+            fail_replace(owner, m.user_ref, symbol, ref, done.reason);
+        }
+    }
+
+    // An invalid replace is refused for the new UserRefNum, and then the original order
+    // is canceled, as OUCH does.
+    void fail_replace(OwnerId owner, UserRefNum user_ref, SymbolId symbol, OrderRef ref,
+                      WireRejectReason reason) {
+        reject(owner, user_ref, reason);
+        engine_.cancel(symbol, ref);
+    }
+
+    // Engine events. Each one is turned into the matching outbound message.
+
+    void on_accepted(SymbolId symbol, const OrderAccepted& e) override {
+        const Index i = by_ref_.find(e.order_id);
+        if (i == FlatIdMap::kNotFound) {
+            return;
+        }
+        Record& r = records_[i];
+        r.open = e.qty;
+        send(r.owner, AcceptedMessage{.timestamp = now_,
+                                      .user_ref = r.user_ref,
+                                      .side = e.side,
+                                      .qty = e.qty,
+                                      .symbol = engine_.ticker(symbol),
+                                      .price = e.price,
+                                      .tif = e.tif,
+                                      .type = e.type,
+                                      .post_only = e.post_only,
+                                      .order_ref = e.order_id});
+    }
+
+    void on_rejected(SymbolId /*symbol*/, const OrderRejected& e) override {
+        const Index i = by_ref_.find(e.order_id);
+        if (i == FlatIdMap::kNotFound) {
+            return;
+        }
+        const Record r = records_[i];
+        release(i);
+        reject(r.owner, r.user_ref, wire_reason(e.reason));
+    }
+
+    void on_trade(SymbolId /*symbol*/, const Trade& t) override {
+        executed(t.aggressor_id, t, t.aggressor_remaining, Liquidity::Removed);
+        executed(t.resting_id, t, t.resting_remaining, Liquidity::Added);
+    }
+
+    void executed(OrderRef ref, const Trade& t, Qty remaining, Liquidity liquidity) {
+        const Index i = by_ref_.find(ref);
+        if (i == FlatIdMap::kNotFound) {
+            return;
+        }
+        Record& r = records_[i];
+        r.executed += t.qty;
+        r.open = remaining;
+        const OwnerId owner = r.owner;
+        const ExecutedMessage m{.timestamp = now_,
+                                .user_ref = r.user_ref,
+                                .qty = t.qty,
+                                .price = t.price,
+                                .liquidity = liquidity,
+                                .match = t.match_id};
+        if (remaining == 0) {
+            release(i);
+        }
+        send(owner, m);
+    }
+
+    void on_canceled(SymbolId /*symbol*/, const OrderCanceled& e) override {
+        const Index i = by_ref_.find(e.order_id);
+        if (i == FlatIdMap::kNotFound) {
+            return;
+        }
+        Record& r = records_[i];
+        r.open = e.remaining_qty;
+        const OwnerId owner = r.owner;
+        const CanceledMessage m{.timestamp = now_,
+                                .user_ref = r.user_ref,
+                                .qty = e.canceled_qty,
+                                .reason = wire_reason(e.reason)};
+        if (e.remaining_qty == 0) {
+            release(i);
+        }
+        send(owner, m);
+    }
+
+    void on_modified(SymbolId symbol, const OrderModified& e) override {
+        const Index i = by_ref_.find(e.order_id);
+        if (i == FlatIdMap::kNotFound) {
+            return;
+        }
+        Record& r = records_[i];
+        const Qty old_open = r.open;
+        r.open = e.qty;
+        r.price = e.price;
+        if (pending_.kind == PendingCall::Kind::None) {
+            return;
+        }
+        if (pending_.kind == PendingCall::Kind::Reduce) {
+            send(r.owner, CanceledMessage{.timestamp = now_,
+                                          .user_ref = r.user_ref,
+                                          .qty = old_open - e.qty,
+                                          .reason = WireCancelReason::UserRequested});
+            return;
+        }
+        // A replace. From here on the order is known by its new UserRefNum, so any
+        // executions caused by re-entering it are reported under the new number.
+        const UserRefNum orig = r.user_ref;
+        by_client_.erase(client_key(r.owner, orig));
+        r.user_ref = pending_.new_user_ref;
+        by_client_.insert(client_key(r.owner, r.user_ref), i);
+        send(r.owner, ReplacedMessage{.timestamp = now_,
+                                      .orig_user_ref = orig,
+                                      .user_ref = r.user_ref,
+                                      .side = e.side,
+                                      .qty = e.qty,
+                                      .symbol = engine_.ticker(symbol),
+                                      .price = e.price,
+                                      .order_ref = e.order_id,
+                                      .kept_priority = e.kept_priority});
+    }
+
+    void on_modify_rejected(SymbolId /*symbol*/, const ModifyRejected& e) override {
+        pending_.refused = true;
+        pending_.reason = wire_reason(e.reason);
+    }
+
+    static WireRejectReason wire_reason(RejectReason reason) noexcept {
+        switch (reason) {
+            case RejectReason::ZeroQuantity:
+            case RejectReason::InvalidLotSize:
+                return WireRejectReason::InvalidQuantity;
+            case RejectReason::InvalidPrice:
+            case RejectReason::PriceOutOfRange:
+                return WireRejectReason::InvalidPrice;
+            case RejectReason::InvalidOrderType:
+                return WireRejectReason::InvalidOrderType;
+            case RejectReason::PostOnlyWouldCross:
+                return WireRejectReason::PostOnlyWouldCross;
+            case RejectReason::DuplicateOrderId:
+            case RejectReason::UnknownOrderId:
+                return WireRejectReason::Other;
+        }
+        return WireRejectReason::Other;
+    }
+
+    static WireCancelReason wire_reason(CancelReason reason) noexcept {
+        switch (reason) {
+            case CancelReason::UserRequested:
+                return WireCancelReason::UserRequested;
+            case CancelReason::Unfilled:
+                return WireCancelReason::ImmediateOrCancel;
+            case CancelReason::SelfTradePrevention:
+                return WireCancelReason::SelfMatchPrevention;
+            case CancelReason::BookFull:
+                return WireCancelReason::System;
+        }
+        return WireCancelReason::System;
+    }
+
+    OutboundSink* sink_;
+    OrderEntryConfig config_;
+    Engine<Book> engine_;
+    IndexPool<Record> records_;
+    FlatIdMap by_client_;                    // client_key(owner, UserRefNum) to record index.
+    FlatIdMap by_ref_;                       // Order Reference Number to record index.
+    std::vector<UserRefNum> last_user_ref_;  // Indexed by owner. Slot 0 is unused.
+    OrderEntryStats stats_;
+    OrderRef last_order_ref_ = 0;
+    Timestamp now_ = 0;
+    PendingCall pending_;
+};
+
+}  // namespace litbook::protocol

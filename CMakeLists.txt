@@ -27,7 +27,9 @@ add_library(litbook STATIC
     src/book/fast_order_book.cpp
     src/book/map_order_book.cpp
     src/book/sorted_order_book.cpp
-    src/itch/binary_file_reader.cpp)
+    src/engine/engine.cpp
+    src/itch/binary_file_reader.cpp
+    src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(litbook PRIVATE litbook::warnings)

@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-#include "book_fuzzer.hpp"
+#include "fuzz_target.hpp"
 
 namespace {
 

@@ -22,8 +22,6 @@
 // Value ranges are deliberately narrow, so even short inputs reach band edges, a full
 // book, self-trades and duplicate IDs.
 
-#include "book_fuzzer.hpp"
-
 #include "litbook/book/book_config.hpp"
 #include "litbook/book/fast_order_book.hpp"
 #include "litbook/book/map_order_book.hpp"
@@ -39,6 +37,7 @@
 #include <span>
 
 #include "book/naive_book.hpp"
+#include "fuzz_target.hpp"
 
 namespace litbook::fuzz {
 namespace {

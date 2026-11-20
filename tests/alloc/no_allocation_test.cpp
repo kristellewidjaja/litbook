@@ -12,6 +12,9 @@
 #include "litbook/book/listener.hpp"
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/sorted_order_book.hpp"
+#include "litbook/engine/engine.hpp"
+#include "litbook/engine/engine_listener.hpp"
+#include "litbook/protocol/order_entry.hpp"
 
 #include <gtest/gtest.h>
 
@@ -20,10 +23,16 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <random>
+#include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "book/book_test_support.hpp"
 #include "book/workload.hpp"
+#include "protocol/order_entry_stream.hpp"
+#include "support/unwrap.hpp"
 
 namespace {
 
@@ -206,6 +215,128 @@ TEST(NoAllocationTest, FastOrderBookNeverAllocatesAfterConstruction) {
 // it never runs out.
 TEST(NoAllocationTest, SortedOrderBookNeverAllocatesAfterConstruction) {
     expect_no_allocations<SortedOrderBook>();
+}
+
+// Counts engine events without allocating, like CountingListener above.
+class CountingEngineListener final : public EngineListener {
+public:
+    void on_accepted(SymbolId /*s*/, const OrderAccepted& /*e*/) override { ++events; }
+    void on_rejected(SymbolId /*s*/, const OrderRejected& /*e*/) override { ++events; }
+    void on_trade(SymbolId /*s*/, const Trade& /*e*/) override { ++trades; }
+    void on_canceled(SymbolId /*s*/, const OrderCanceled& /*e*/) override { ++events; }
+    void on_cancel_rejected(SymbolId /*s*/, const CancelRejected& /*e*/) override { ++events; }
+    void on_modified(SymbolId /*s*/, const OrderModified& /*e*/) override { ++events; }
+    void on_modify_rejected(SymbolId /*s*/, const ModifyRejected& /*e*/) override { ++events; }
+    void on_level_update(SymbolId /*s*/, const LevelUpdate& /*e*/) override { ++events; }
+
+    std::uint64_t events = 0;
+    std::uint64_t trades = 0;
+};
+
+// Puts every standard workload on its own stock in one engine, then replays them with
+// their operations interleaved. Routing, ticker lookup and the trade renumbering must not
+// allocate either.
+template <class Book>
+void expect_engine_never_allocates() {
+    const auto workloads = testing::standard_workloads();
+    CountingEngineListener listener;
+    Engine<Book> engine(listener, workloads.size());
+    std::vector<std::vector<testing::Operation>> streams;
+    std::vector<Ticker> tickers;
+    for (const auto& params : workloads) {
+        tickers.push_back(testing::unwrap(make_ticker("W" + std::to_string(streams.size()))));
+        engine.add_symbol(tickers.back(), testing::book_config(params));
+        streams.push_back(testing::generate(params));
+    }
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        for (std::size_t i = 0;; ++i) {
+            bool any = false;
+            for (std::size_t s = 0; s < streams.size(); ++s) {
+                if (i >= streams[s].size()) {
+                    continue;
+                }
+                any = true;
+                const SymbolId symbol = testing::unwrap(engine.find(tickers[s]));
+                const testing::Operation& op = streams[s][i];
+                switch (op.kind) {
+                    case testing::Operation::Kind::Submit:
+                        engine.submit(symbol, op.request);
+                        break;
+                    case testing::Operation::Kind::Cancel:
+                        engine.cancel(symbol, op.id);
+                        break;
+                    case testing::Operation::Kind::Modify:
+                        engine.modify(symbol, op.id, op.price, op.qty);
+                        break;
+                }
+            }
+            if (!any) {
+                break;
+            }
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_GT(listener.trades, 0U);
+    EXPECT_EQ(engine.last_match_id(), listener.trades);
+    EXPECT_TRUE(engine.check_invariants());
+}
+
+TEST(NoAllocationTest, EngineOverFastBooksNeverAllocates) {
+    expect_engine_never_allocates<FastOrderBook>();
+}
+
+TEST(NoAllocationTest, EngineOverSortedBooksNeverAllocates) {
+    expect_engine_never_allocates<SortedOrderBook>();
+}
+
+// Counts outbound frames without allocating.
+class CountingSink final : public protocol::OutboundSink {
+public:
+    void send(OwnerId /*owner*/, std::span<const std::byte> frame) override {
+        ++frames;
+        bytes += frame.size();
+    }
+    std::uint64_t frames = 0;
+    std::uint64_t bytes = 0;
+};
+
+// The whole order entry path, from decoding a frame to encoding the replies, must not
+// allocate once the stocks are listed.
+template <class Book>
+void expect_order_entry_never_allocates() {
+    const auto stream = testing::order_entry_stream(7, 50'000);
+    CountingSink sink;
+    protocol::OrderEntry<Book> entry(sink,
+                                     {.max_owners = 4, .max_live_orders = 4096, .max_symbols = 2});
+    for (const char* name : testing::kStreamStocks) {
+        entry.add_symbol(testing::unwrap(make_ticker(name)),
+                         testing::with_test_limits(BookConfig{.tick_size = 100}));
+    }
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        protocol::Timestamp now = 0;
+        for (const testing::InboundFrame& frame : stream) {
+            (void)entry.on_frame(frame.owner, frame.bytes, ++now);
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_GT(sink.frames, 50'000U);
+    EXPECT_GT(entry.stats().malformed, 0U);
+    EXPECT_GT(entry.engine().last_match_id(), 1'000U);
+    EXPECT_TRUE(entry.engine().check_invariants());
+}
+
+TEST(NoAllocationTest, OrderEntryOverFastBooksNeverAllocates) {
+    expect_order_entry_never_allocates<FastOrderBook>();
+}
+
+TEST(NoAllocationTest, OrderEntryOverSortedBooksNeverAllocates) {
+    expect_order_entry_never_allocates<SortedOrderBook>();
 }
 
 }  // namespace

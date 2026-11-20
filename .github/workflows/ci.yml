@@ -45,9 +45,10 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
 
-  # Short libFuzzer run of the differential fuzz target (all three books must agree).
-  # The saved inputs in fuzz/seeds and fuzz/regressions also run in every job above as
-  # the FuzzCorpusReplay test; this job searches for new failing inputs.
+  # Short libFuzzer runs of both fuzz targets: the differential book target (all three
+  # books must agree) and the protocol codec target (no crash, canonical re-encoding).
+  # The saved inputs also run in every job above as the FuzzCorpusReplay and
+  # ProtocolFuzzCorpusReplay tests; this job searches for new failing inputs.
   fuzz:
     name: fuzz / clang
     runs-on: ubuntu-24.04
@@ -68,6 +69,12 @@ jobs:
           mkdir -p corpus artifacts
           ./build/fuzz/fuzz/book_fuzzer -max_total_time=60 -max_len=1024 -timeout=10 \
             -artifact_prefix=artifacts/ corpus fuzz/seeds
+
+      - name: Fuzz the protocol codec for 60 seconds
+        run: |
+          mkdir -p protocol_corpus artifacts
+          ./build/fuzz/fuzz/protocol_fuzzer -max_total_time=60 -max_len=128 -timeout=10 \
+            -artifact_prefix=artifacts/protocol- protocol_corpus fuzz/protocol_seeds
 
       - name: Upload failing inputs
         if: failure()

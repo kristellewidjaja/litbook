@@ -23,9 +23,9 @@ namespace litbook {
 // arrive close together land in nearby slots, and the slots touched by recent orders
 // stay in cache. Fibonacci hashing, used before, scatters nearby IDs across the whole
 // table. On a full Nasdaq day the fold won 4 of 5 before/after pairs, with the median
-// replay CPU time about 6% lower (see DECISIONS.md D-039). Every bit of the key still reaches the index, so keys that
-// differ only in high bits do not all collide. It is not hardened against adversarial
-// keys, which is fine for exchange-assigned IDs.
+// replay CPU time about 6% lower (see DECISIONS.md D-039). Every bit of the key still
+// reaches the index, so keys that differ only in high bits do not all collide. It is not
+// hardened against adversarial keys, which is fine for exchange-assigned IDs.
 // Erase uses backward-shift deletion instead of tombstones (markers left in deleted
 // slots), so the table never fills up with dead slots under heavy churn.
 //
