@@ -12,15 +12,20 @@
 #include "litbook/book/listener.hpp"
 #include "litbook/book/map_order_book.hpp"
 #include "litbook/book/sorted_order_book.hpp"
+#include "litbook/concurrency/mutex_queue.hpp"
+#include "litbook/concurrency/spsc_queue.hpp"
 #include "litbook/engine/engine.hpp"
 #include "litbook/engine/engine_listener.hpp"
 #include "litbook/gateway/epoll_gateway.hpp"
 #include "litbook/gateway/session_manager.hpp"
 #include "litbook/gateway/soup.hpp"
+#include "litbook/pipeline/threaded_gateway.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -30,25 +35,27 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "book/book_test_support.hpp"
 #include "book/workload.hpp"
+#include "concurrency/queue_test_support.hpp"
 #include "gateway/test_client.hpp"
 #include "protocol/order_entry_stream.hpp"
 #include "support/unwrap.hpp"
 
 namespace {
 
-// These are plain globals because the tests are single-threaded and the hook must not
-// allocate.
-bool g_armed = false;
-std::uint64_t g_allocations = 0;
+// The hook must not allocate itself. The counters are atomic because the pipeline tests
+// count allocations made on the pipeline's own threads too.
+std::atomic<bool> g_armed{false};
+std::atomic<std::uint64_t> g_allocations{0};
 
 void* counted_alloc(std::size_t size, std::size_t alignment) {
-    if (g_armed) {
-        ++g_allocations;
+    if (g_armed.load(std::memory_order_relaxed)) {
+        g_allocations.fetch_add(1, std::memory_order_relaxed);
     }
     size = size == 0 ? 1 : size;
     // NOLINTBEGIN(cppcoreguidelines-no-malloc): this *is* the allocator
@@ -126,16 +133,16 @@ namespace {
 class AllocationCounter {
 public:
     AllocationCounter() {
-        g_allocations = 0;
-        g_armed = true;
+        g_allocations.store(0);
+        g_armed.store(true);
     }
-    ~AllocationCounter() { g_armed = false; }
+    ~AllocationCounter() { g_armed.store(false); }
     AllocationCounter(const AllocationCounter&) = delete;
     AllocationCounter& operator=(const AllocationCounter&) = delete;
     AllocationCounter(AllocationCounter&&) = delete;
     AllocationCounter& operator=(AllocationCounter&&) = delete;
 
-    [[nodiscard]] std::uint64_t count() const noexcept { return g_allocations; }
+    [[nodiscard]] std::uint64_t count() const noexcept { return g_allocations.load(); }
 };
 
 // This listener only counts events, so it does not allocate.
@@ -528,6 +535,164 @@ TEST(NoAllocationTest, EpollGatewayNeverAllocatesWhileServing) {
     EXPECT_EQ(replies, kOwners + m.stats().messages_out);  // Logins plus every reply.
     EXPECT_GT(m.stats().messages_out, 15'000U);
     EXPECT_GT(m.order_entry().engine().last_match_id(), 500U);
+}
+
+// The queues allocate their slots in the constructor and never again. This pushes and
+// pops through every call (including the waiting calls of MutexQueue, which do not wait
+// here because there is always room or a message). The counter is a plain global, so
+// this runs on one thread. Allocating or not does not depend on which thread calls.
+template <class Queue>
+void expect_queue_never_allocates() {
+    using concurrency::testing::make_message;
+    using concurrency::testing::TestMessage;
+    Queue queue(64);
+    std::uint64_t pushed = 0;
+    std::uint64_t popped = 0;
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        for (int round = 0; round < 10'000; ++round) {
+            const int batch = 1 + (round % 64);
+            for (int i = 0; i < batch; ++i) {
+                if (queue.try_push(make_message(pushed))) {
+                    ++pushed;
+                }
+            }
+            TestMessage out;
+            while (queue.try_pop(out)) {
+                ++popped;
+            }
+            if (queue.try_push(make_message(pushed))) {
+                ++pushed;
+            }
+            if (queue.front() != nullptr) {
+                queue.pop();
+                ++popped;
+            }
+            if constexpr (requires { queue.push_wait(out); }) {
+                queue.push_wait(make_message(pushed));
+                ++pushed;
+                queue.pop_wait(out);
+                ++popped;
+            }
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(pushed, popped);
+    EXPECT_GT(pushed, 300'000U);
+}
+
+TEST(NoAllocationTest, SpscQueueNeverAllocates) {
+    expect_queue_never_allocates<concurrency::SpscQueue<concurrency::testing::TestMessage>>();
+}
+
+TEST(NoAllocationTest, MutexQueueNeverAllocates) {
+    expect_queue_never_allocates<concurrency::MutexQueue<concurrency::testing::TestMessage>>();
+}
+
+}  // namespace
+}  // namespace litbook
+
+namespace litbook {
+namespace {
+
+// The threaded pipeline serving 20,000 frames from four clients over real sockets. The
+// counter is armed from the first login until stop() has joined the threads, so it sees
+// every allocation on the gateway, matching and publisher threads while they serve, and
+// during the shutdown (End of Session, cancel on disconnect, Stop). Starting the threads
+// happens before, because creating a thread allocates.
+template <pipeline::WaitMode Mode>
+void expect_pipeline_never_allocates() {
+    using Exchange = pipeline::ThreadedGateway<SortedOrderBook, concurrency::SpscQueue>;
+    constexpr OwnerId kOwners = 4;
+    const std::array<std::string_view, kOwners + 1> users{"", "ann", "ben", "cy", "dee"};
+
+    const auto stream = testing::order_entry_stream(17, 20'000);
+    std::vector<std::vector<std::byte>> packets;
+    std::vector<OwnerId> owners;
+    for (const testing::InboundFrame& frame : stream) {
+        if (protocol::decode_inbound(frame.bytes).status != protocol::DecodeStatus::Ok) {
+            continue;
+        }
+        std::vector<std::byte> packet(gateway::soup::kHeaderSize + frame.bytes.size());
+        (void)gateway::soup::encode_packet(gateway::soup::PacketType::UnsequencedData, frame.bytes,
+                                           packet);
+        packets.push_back(std::move(packet));
+        owners.push_back(frame.owner);
+    }
+    std::array<std::vector<std::byte>, kOwners + 1> logins{};
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        const auto request = gateway::soup::make_login_request(users.at(owner), "pw", "", 0);
+        logins.at(owner).resize(gateway::soup::kHeaderSize + gateway::soup::kLoginRequestPayload);
+        (void)gateway::soup::encode_login_request(testing::unwrap(request), logins.at(owner));
+    }
+
+    Exchange exchange(gateway::SessionConfig{.max_connections = 8},
+                      {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2},
+                      gateway::GatewayConfig{}, pipeline::PipelineConfig{.wait = Mode});
+    for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+        // Every account cancels on disconnect, so the shutdown has real work to do.
+        exchange.add_account(
+            {.username = users.at(owner), .password = "pw", .cancel_on_disconnect = true});
+    }
+    for (const char* name : testing::kStreamStocks) {
+        exchange.add_symbol(testing::unwrap(make_ticker(name)),
+                            testing::with_test_limits(BookConfig{.tick_size = 100}));
+    }
+    std::vector<std::unique_ptr<gateway::testing::TestClient>> clients;
+    for (OwnerId owner = 0; owner <= kOwners; ++owner) {
+        clients.push_back(std::make_unique<gateway::testing::TestClient>(exchange.port()));
+    }
+    exchange.start();
+
+    std::uint64_t replies = 0;
+    auto drain = [&] {
+        for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+            auto& c = *clients.at(owner);
+            c.read_available();
+            while (c.next_packet().status == gateway::soup::PacketStatus::Complete) {
+                ++replies;
+            }
+        }
+    };
+
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        for (OwnerId owner = 1; owner <= kOwners; ++owner) {
+            (void)clients.at(owner)->send_some(logins.at(owner));
+        }
+        for (std::size_t i = 0; i < packets.size(); ++i) {
+            auto& c = *clients.at(owners[i]);
+            std::span<const std::byte> rest(packets[i]);
+            while (!rest.empty()) {
+                rest = rest.subspan(c.send_some(rest));
+                drain();
+            }
+        }
+        // Give the last replies a moment to come back before stopping.
+        for (int round = 0; round < 50; ++round) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            drain();
+        }
+        exchange.stop();
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(exchange.sessions().stats().logins_accepted, kOwners);
+    EXPECT_GT(exchange.sessions().stats().messages_out, 15'000U);
+    EXPECT_GT(replies, 15'000U);
+    EXPECT_GT(exchange.publisher().stats().trades, 500U);
+    EXPECT_EQ(exchange.matching().order_entry().live_orders(), 0U);  // Cancel on disconnect.
+}
+
+TEST(NoAllocationTest, SpinningPipelineNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Spin>();
+}
+
+TEST(NoAllocationTest, BlockingPipelineNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Block>();
 }
 
 }  // namespace

@@ -36,6 +36,24 @@ protected:
     OutboundSink& operator=(OutboundSink&&) = default;
 };
 
+// Receives the public side of every book event, trades and changes to price levels, in
+// the order the books produce them. In Phase 7 the matching thread passes them on to the
+// publisher thread, which becomes the market data feed in Phase 8. The events are only
+// valid during the call.
+class MarketDataSink {
+public:
+    virtual ~MarketDataSink() = default;
+    virtual void on_trade(SymbolId symbol, const Trade& trade) = 0;
+    virtual void on_level_update(SymbolId symbol, const LevelUpdate& update) = 0;
+
+protected:
+    MarketDataSink() = default;
+    MarketDataSink(const MarketDataSink&) = default;
+    MarketDataSink(MarketDataSink&&) = default;
+    MarketDataSink& operator=(const MarketDataSink&) = default;
+    MarketDataSink& operator=(MarketDataSink&&) = default;
+};
+
 // Pre-trade risk limits for one account. An Enter Order or Replace Order that breaks one
 // is refused before it reaches the book. The defaults are so large that they never apply.
 struct RiskLimits {
@@ -117,6 +135,10 @@ public:
         account_at(owner).limits = limits;
     }
 
+    // Sends every trade and level update to `sink` as well, or to nobody for nullptr.
+    // This is a startup call, and the sink must outlive the order entry layer.
+    void set_market_data_sink(MarketDataSink* sink) noexcept { market_data_ = sink; }
+
     // Decodes one inbound frame from `owner` and handles it. A malformed frame is counted
     // and its DecodeStatus is returned, and nothing else happens. `now` is the timestamp
     // put on every outbound message this frame causes.
@@ -167,6 +189,7 @@ public:
     }
 
     [[nodiscard]] const Engine<Book>& engine() const noexcept { return engine_; }
+    [[nodiscard]] const OrderEntryConfig& config() const noexcept { return config_; }
     [[nodiscard]] const OrderEntryStats& stats() const noexcept { return stats_; }
     [[nodiscard]] std::uint32_t live_orders() const noexcept { return records_.in_use(); }
     [[nodiscard]] UserRefNum last_user_ref(OwnerId owner) const {
@@ -467,9 +490,18 @@ private:
         reject(r.owner, r.user_ref, wire_reason(e.reason));
     }
 
-    void on_trade(SymbolId /*symbol*/, const Trade& t) override {
+    void on_trade(SymbolId symbol, const Trade& t) override {
         executed(t.aggressor_id, t, t.aggressor_remaining, Liquidity::Removed);
         executed(t.resting_id, t, t.resting_remaining, Liquidity::Added);
+        if (market_data_ != nullptr) {
+            market_data_->on_trade(symbol, t);
+        }
+    }
+
+    void on_level_update(SymbolId symbol, const LevelUpdate& update) override {
+        if (market_data_ != nullptr) {
+            market_data_->on_level_update(symbol, update);
+        }
     }
 
     void executed(OrderRef ref, const Trade& t, Qty remaining, Liquidity liquidity) {
@@ -601,6 +633,7 @@ private:
     OrderRef last_order_ref_ = 0;
     Timestamp now_ = 0;
     PendingCall pending_;
+    MarketDataSink* market_data_ = nullptr;
 };
 
 }  // namespace litbook::protocol

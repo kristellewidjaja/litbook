@@ -2,14 +2,19 @@
 
 #include "litbook/book/order_book.hpp"
 #include "litbook/engine/ticker.hpp"
+#include "litbook/gateway/inline_backend.hpp"
+#include "litbook/gateway/order_backend.hpp"
 #include "litbook/gateway/session.hpp"
 #include "litbook/gateway/soup.hpp"
+#include "litbook/metrics/latency_histogram.hpp"
+#include "litbook/metrics/tick_clock.hpp"
 #include "litbook/protocol/codec.hpp"
 #include "litbook/protocol/order_entry.hpp"
 #include "litbook/types.hpp"
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -17,6 +22,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace litbook::gateway {
@@ -45,6 +51,13 @@ struct SessionConfig {
     // buffer is room for replies that cannot be held back, such as executions caused by
     // other accounts' orders.
     std::size_t output_high_water = std::size_t{32} * 1024;
+    // The most requests of one account that may wait at an asynchronous backend (the
+    // matching thread) at the same time. Only used when the backend is asynchronous.
+    std::uint32_t max_in_flight = 64;
+    // Every Nth order taken by the backend is timed, from the moment it is handed over
+    // until every reply to it is in the output buffer (see request_latency()). 0 turns
+    // the sampling off. It exists for the benchmarks.
+    std::uint32_t sample_every = 0;
     // A heartbeat goes out when nothing else was sent to a client for this long.
     Timestamp heartbeat_interval = 1'000'000'000;
     // A logged in client that sends nothing for this long is disconnected.
@@ -64,6 +77,10 @@ struct SessionStats {
     // used up a sequence number (see docs/PROTOCOL.md).
     std::uint64_t messages_dropped = 0;
     std::uint64_t heartbeats_out = 0;
+    // Times a packet had to wait because the backend's queue was full.
+    std::uint64_t backend_busy = 0;
+    // Cancels on disconnect that could not be queued at once and were sent later.
+    std::uint64_t cancels_deferred = 0;
     std::array<std::uint64_t, kCloseReasonCount> closes{};  // Indexed by CloseReason.
 
     [[nodiscard]] std::uint64_t closed(CloseReason reason) const noexcept {
@@ -71,7 +88,10 @@ struct SessionStats {
     }
 };
 
-// The SoupBinTCP session layer in front of the order entry layer. It knows nothing about
+// The SoupBinTCP session layer in front of an order backend (see order_backend.hpp). The
+// backend is either the order entry layer itself, called on this thread (InlineBackend,
+// which the SessionManager<Book> alias uses), or a queue to a matching thread
+// (QueueBackend). The session layer knows nothing about
 // sockets. The network code (or a test) tells it that a connection opened, hands it the
 // bytes that arrived, calls tick() regularly so it can send heartbeats and notice
 // timeouts, writes out whatever output() holds, and calls close() when the connection is
@@ -91,15 +111,27 @@ struct SessionStats {
 // the processing. A connection is only dropped for OutputFull when replies that cannot
 // be held back fill its whole output buffer, which means the client stopped reading.
 //
+// With an asynchronous backend the replies to a request arrive later, so the output alone
+// does not show how much is still coming. The session layer then also counts each
+// account's requests in flight (forwarded but not yet reported done through
+// request_done()). The next packet is only forwarded while the output plus one reply's
+// worth of room per request in flight stays below the high water mark, and while fewer
+// than max_in_flight requests are in flight. If the backend's queue is full, the packet
+// stays in the input buffer and retry_waiting() offers it again later. The gateway thread
+// therefore never waits for the matching thread.
+//
 // Every connection slot and buffer is allocated in the constructor, so handling bytes,
 // ticks and closes never allocates.
 //
 // These invariants hold between calls. An account's connection, if it has one, is an
 // open session that is logged in as that account (or closing after being logged in).
 // Every account's next_sequence() is 1 plus the number of sequenced messages produced
-// for it. open_connections() is the number of sessions in use.
-template <OrderBook Book>
-class SessionManager final : private protocol::OutboundSink {
+// for it. open_connections() is the number of sessions in use. With an asynchronous
+// backend, in_flight(owner) is the number of the account's requests that were forwarded
+// and not yet reported done, and is always 0 with an inline backend. With sampling on, at most one
+// sampled order is being timed at a time.
+template <OrderBackend Backend>
+class BasicSessionManager final : private ReplyTarget {
 public:
     using ConnectionId = std::uint32_t;
     static constexpr ConnectionId kNoConnection = std::numeric_limits<ConnectionId>::max();
@@ -108,13 +140,18 @@ public:
     // is the size of a Login Request, the largest packet a client needs to send.
     static constexpr std::size_t kMaxClientPacket = 1 + soup::kLoginRequestPayload;
 
+    // Builds the backend from backend_args, for example a QueueBackend from its queue.
     // Throws std::invalid_argument for a bad session name, zero connections, buffers too
-    // small to hold one packet, or a zero time limit, and whatever OrderEntry throws.
-    SessionManager(const SessionConfig& config, const protocol::OrderEntryConfig& order_entry)
+    // small to hold one packet, a zero time limit or a zero max_in_flight, and whatever
+    // the backend throws.
+    template <class... BackendArgs>
+    BasicSessionManager(const SessionConfig& config, std::in_place_t /*build backend*/,
+                        BackendArgs&&... backend_args)
         : config_(checked(config)),
           session_name_(padded_left<soup::kSessionLength>(config.session_name)),
-          order_entry_(*this, order_entry),
-          accounts_(static_cast<std::size_t>(order_entry.max_owners) + 1) {
+          backend_(std::forward<BackendArgs>(backend_args)...),
+          accounts_(static_cast<std::size_t>(backend_.max_owners()) + 1) {
+        backend_.attach(*this);
         sessions_.reserve(config.max_connections);
         free_.reserve(config.max_connections);
         for (ConnectionId i = 0; i < config.max_connections; ++i) {
@@ -125,11 +162,18 @@ public:
         }
     }
 
-    SessionManager(const SessionManager&) = delete;
-    SessionManager& operator=(const SessionManager&) = delete;
-    SessionManager(SessionManager&&) = delete;
-    SessionManager& operator=(SessionManager&&) = delete;
-    ~SessionManager() override = default;
+    // The usual way to build the single-threaded session layer, whose InlineBackend only
+    // needs the order entry configuration.
+    BasicSessionManager(const SessionConfig& config, const protocol::OrderEntryConfig& order_entry)
+        requires std::constructible_from<Backend, const protocol::OrderEntryConfig&>
+        : BasicSessionManager(config, std::in_place, order_entry) {}
+
+    // The backend holds a reference to this object, so it must never move.
+    BasicSessionManager(const BasicSessionManager&) = delete;
+    BasicSessionManager& operator=(const BasicSessionManager&) = delete;
+    BasicSessionManager(BasicSessionManager&&) = delete;
+    BasicSessionManager& operator=(BasicSessionManager&&) = delete;
+    ~BasicSessionManager() override = default;
 
     // Startup calls.
 
@@ -154,12 +198,12 @@ public:
         a.username = username;
         a.password = upper(padded_right<soup::kPasswordLength>(account.password));
         a.cancel_on_disconnect = account.cancel_on_disconnect;
-        order_entry_.set_risk_limits(owner, account.limits);
+        backend_.set_risk_limits(owner, account.limits);
         return owner;
     }
 
     SymbolId add_symbol(Ticker ticker, const BookConfig& config) {
-        return order_entry_.add_symbol(ticker, config);
+        return backend_.add_symbol(ticker, config);
     }
 
     // Connection events, called by the network code.
@@ -317,8 +361,75 @@ public:
         // The account is detached first, so the cancel messages below are counted as
         // dropped instead of being queued on a connection that no longer exists.
         a.connection = kNoConnection;
-        if (a.cancel_on_disconnect) {
-            order_entry_.cancel_all(owner, now);
+        if (a.cancel_on_disconnect && !backend_.cancel_all(owner, now)) {
+            // The backend's queue is full. retry_waiting() sends the cancel later, and
+            // until then the account's input is held back, so no new order of the
+            // account can overtake its cancel.
+            a.cancel_pending = true;
+            retry_needed_ = true;
+            ++stats_.cancels_deferred;
+        }
+    }
+
+    // Replies from an asynchronous backend, called by the code that drains its queue.
+
+    // A reply for `owner` arrived. It gets the account's next sequence number and goes
+    // to the account's connection, or is counted as dropped if there is none.
+    void deliver(OwnerId owner, std::span<const std::byte> frame, Timestamp now) {
+        now_ = now;
+        on_reply(owner, frame);
+    }
+
+    // The backend finished one request of `owner`, and every reply to it has been
+    // delivered. If the connection was held back by requests in flight, its waiting
+    // input is processed now.
+    void request_done(OwnerId owner, Timestamp now) {
+        if (owner == kNoOwner || owner > account_count_) {
+            return;
+        }
+        Account& a = accounts_[owner];
+        if (a.in_flight > 0) {
+            --a.in_flight;
+            if (owner == sample_owner_) {
+                end_sample_if_done();
+            }
+        }
+        if (a.connection == kNoConnection) {
+            return;
+        }
+        Session& s = sessions_[a.connection];
+        if (!s.closing() && !s.input().empty()) {
+            now_ = now;
+            process_input(a.connection, s);
+        }
+    }
+
+    // Offers again whatever had to wait because the backend was busy, first the deferred
+    // cancels on disconnect and then the waiting input of every connection. It does
+    // nothing unless something had to wait, so it is cheap to call after every drain of
+    // the reply queue.
+    void retry_waiting(Timestamp now) {
+        if (!retry_needed_) {
+            return;
+        }
+        retry_needed_ = false;
+        now_ = now;
+        for (std::size_t owner = 1; owner <= account_count_; ++owner) {
+            Account& a = accounts_[owner];
+            if (!a.cancel_pending) {
+                continue;
+            }
+            if (!backend_.cancel_all(static_cast<OwnerId>(owner), now)) {
+                retry_needed_ = true;
+                return;  // Still busy. Input must not overtake the cancel, so stop here.
+            }
+            a.cancel_pending = false;
+        }
+        for (ConnectionId id = 0; id < sessions_.size(); ++id) {
+            Session& s = sessions_[id];
+            if (s.in_use() && !s.closing() && !s.input().empty()) {
+                process_input(id, s);
+            }
         }
     }
 
@@ -334,9 +445,30 @@ public:
         return static_cast<std::uint32_t>(sessions_.size());
     }
     [[nodiscard]] const SessionStats& stats() const noexcept { return stats_; }
-    [[nodiscard]] const protocol::OrderEntry<Book>& order_entry() const noexcept {
-        return order_entry_;
+    // The sampled times in nanoseconds (see SessionConfig::sample_every). With an inline
+    // backend a sample is the forward() call itself, during which the replies are written.
+    // With an asynchronous backend it ends when request_done() reports the order finished.
+    [[nodiscard]] const metrics::LatencyHistogram& request_latency() const noexcept {
+        return request_latency_;
     }
+    [[nodiscard]] const Backend& backend() const noexcept { return backend_; }
+    [[nodiscard]] Backend& backend() noexcept { return backend_; }
+    // Only for a backend that owns the order entry layer, such as InlineBackend.
+    [[nodiscard]] const auto& order_entry() const noexcept
+        requires requires(const Backend& b) { b.order_entry(); }
+    {
+        return backend_.order_entry();
+    }
+    // Throws std::out_of_range for an owner that is not an account.
+    [[nodiscard]] std::uint32_t in_flight(OwnerId owner) const {
+        return account_at(owner).in_flight;
+    }
+    [[nodiscard]] bool cancel_pending(OwnerId owner) const {
+        return account_at(owner).cancel_pending;
+    }
+    // True while a packet or a cancel on disconnect waits for room at the backend, until
+    // retry_waiting() gets it through.
+    [[nodiscard]] bool waiting_for_backend() const noexcept { return retry_needed_; }
     // Throws std::out_of_range for an owner that is not an account.
     [[nodiscard]] std::uint64_t next_sequence(OwnerId owner) const {
         return account_at(owner).next_sequence;
@@ -353,7 +485,15 @@ private:
         bool cancel_on_disconnect = false;
         std::uint64_t next_sequence = 1;  // The number the next sequenced message gets.
         ConnectionId connection = kNoConnection;
+        // Requests forwarded to an asynchronous backend and not reported done yet.
+        std::uint32_t in_flight = 0;
+        // A cancel on disconnect is waiting for room in the backend's queue.
+        bool cancel_pending = false;
     };
+
+    // The most bytes one reply can take in an output buffer, a Sequenced Data packet with
+    // the longest OUCH message.
+    static constexpr std::size_t kLargestReply = soup::kHeaderSize + protocol::kMaxMessageLength;
 
     static SessionConfig checked(const SessionConfig& config) {
         if (!is_name(config.session_name, soup::kSessionLength)) {
@@ -378,6 +518,9 @@ private:
         if (config.heartbeat_interval == 0 || config.idle_timeout == 0 ||
             config.login_timeout == 0) {
             throw std::invalid_argument("time limits must be above 0");
+        }
+        if (config.max_in_flight == 0) {
+            throw std::invalid_argument("max_in_flight must be above 0");
         }
         return config;
     }
@@ -446,8 +589,21 @@ private:
         return kNoOwner;
     }
 
-    // True while the connection's input waits because its output is backed up.
+    // True while the connection's input waits because its output is backed up. With an
+    // asynchronous backend, each request in flight reserves room for one reply, because
+    // its replies are still on the way. The account's input also waits while it has too
+    // many requests in flight or a cancel on disconnect that is not queued yet.
     bool paused(const Session& s) const noexcept {
+        if constexpr (Backend::kAsynchronous) {
+            if (s.owner() != kNoOwner) {
+                const Account& a = accounts_[s.owner()];
+                if (a.cancel_pending || a.in_flight >= config_.max_in_flight) {
+                    return true;
+                }
+                const std::size_t reserved = static_cast<std::size_t>(a.in_flight) * kLargestReply;
+                return s.output().size() + reserved >= config_.output_high_water;
+            }
+        }
         return s.output().size() >= config_.output_high_water;
     }
 
@@ -463,9 +619,13 @@ private:
                 s.close(CloseReason::BadLength);
                 return;
             }
+            const bool handled =
+                handle_packet(id, s, static_cast<soup::PacketType>(static_cast<char>(packet.type)),
+                              packet.payload);
+            if (!handled) {
+                return;  // The backend was busy. The packet stays for retry_waiting().
+            }
             ++stats_.packets_in;
-            handle_packet(id, s, static_cast<soup::PacketType>(static_cast<char>(packet.type)),
-                          packet.payload);
             // The payload points into the input buffer, so it is only removed after it
             // has been handled.
             s.input().consume(packet.size);
@@ -485,14 +645,16 @@ private:
         }
     }
 
-    void handle_packet(ConnectionId id, Session& s, soup::PacketType type,
+    // Handles one whole packet. Returns false only if the packet must wait because the
+    // backend is busy, and then nothing has changed.
+    bool handle_packet(ConnectionId id, Session& s, soup::PacketType type,
                        std::span<const std::byte> payload) {
         if (!is_client_packet(type)) {
             s.close(CloseReason::UnknownPacket);
-            return;
+            return true;
         }
         if (type == soup::PacketType::Debug) {
-            return;  // The specification says to ignore debug packets.
+            return true;  // The specification says to ignore debug packets.
         }
         if (s.state() == SessionState::AwaitingLogin) {
             if (type == soup::PacketType::LoginRequest) {
@@ -500,23 +662,81 @@ private:
             } else {
                 s.close(CloseReason::NotLoggedIn);
             }
-            return;
+            return true;
         }
         switch (type) {
             case soup::PacketType::UnsequencedData:
-                if (order_entry_.on_frame(s.owner(), payload, now_) != protocol::DecodeStatus::Ok) {
-                    s.close(CloseReason::MalformedMessage);
-                }
-                return;
+                return forward_order(s, payload);
             case soup::PacketType::ClientHeartbeat:
-                return;  // Its only job was to show the client is alive.
+                return true;  // Its only job was to show the client is alive.
             case soup::PacketType::LogoutRequest:
                 s.close(CloseReason::Logout);
-                return;
+                return true;
             default:
                 s.close(CloseReason::UnexpectedLogin);
-                return;
+                return true;
         }
+    }
+
+    // Passes one OUCH message to the backend. Returns false if the backend is busy.
+    bool forward_order(Session& s, std::span<const std::byte> payload) {
+        const bool timed = sample_due();
+        std::uint64_t start = 0;
+        if (timed) {
+            start = metrics::TickClock::now();
+        }
+        const ForwardResult result = backend_.forward(s.owner(), payload, now_);
+        if (result == ForwardResult::Busy) {
+            ++stats_.backend_busy;
+            retry_needed_ = true;
+            return false;
+        }
+        if (result == ForwardResult::Malformed) {
+            s.close(CloseReason::MalformedMessage);
+            return true;
+        }
+        const OwnerId owner = s.owner();
+        if (config_.sample_every != 0) {
+            ++orders_since_sample_;
+        }
+        if (timed) {
+            orders_since_sample_ = 0;
+            if constexpr (Backend::kAsynchronous) {
+                // Requests of one account finish in the order they were sent, so this one
+                // is done after the ones already in flight.
+                sample_owner_ = owner;
+                sample_dones_left_ = accounts_[owner].in_flight + 1;
+                sample_start_ = start;
+            } else {
+                record_sample(start);  // The replies were written during forward().
+            }
+        }
+        if constexpr (Backend::kAsynchronous) {
+            ++accounts_[owner].in_flight;
+        }
+        return true;
+    }
+
+    // True if the next order taken by the backend should be timed.
+    [[nodiscard]] bool sample_due() const noexcept {
+        if (config_.sample_every == 0 || sample_owner_ != kNoOwner) {
+            return false;
+        }
+        return orders_since_sample_ + 1 >= config_.sample_every;
+    }
+
+    // Called when one request of the sampled account finished.
+    void end_sample_if_done() noexcept {
+        --sample_dones_left_;
+        if (sample_dones_left_ == 0) {
+            record_sample(sample_start_);
+            sample_owner_ = kNoOwner;
+        }
+    }
+
+    void record_sample(std::uint64_t start) noexcept {
+        const std::uint64_t ticks = metrics::TickClock::now() - start;
+        request_latency_.record(metrics::TickClock::to_ns(ticks));
     }
 
     void handle_login(ConnectionId id, Session& s, std::span<const std::byte> payload) {
@@ -562,9 +782,10 @@ private:
         ++stats_.logins_rejected;
     }
 
-    // The order entry layer calls this for every reply. Each reply gets the account's
-    // next sequence number, whether or not a connection can take it.
-    void send(OwnerId owner, std::span<const std::byte> frame) override {
+    // Every reply comes through here, straight from an inline backend or through
+    // deliver(). Each reply gets the account's next sequence number, whether or not a
+    // connection can take it.
+    void on_reply(OwnerId owner, std::span<const std::byte> frame) override {
         Account& a = accounts_[owner];
         ++a.next_sequence;
         ++stats_.messages_out;
@@ -576,7 +797,7 @@ private:
 
     SessionConfig config_;
     soup::SessionName session_name_;  // Padded on the left, as sent in Login Accepted.
-    protocol::OrderEntry<Book> order_entry_;
+    Backend backend_;
     std::vector<Account> accounts_;  // Indexed by OwnerId. Slot 0 is unused.
     std::size_t account_count_ = 0;
     std::vector<Session> sessions_;   // Indexed by ConnectionId.
@@ -585,6 +806,19 @@ private:
     SessionStats stats_;
     Timestamp now_ = 0;  // The time of the call being handled.
     bool ended_ = false;
+    // Something had to wait for the backend, so retry_waiting() has work to do.
+    bool retry_needed_ = false;
+    // Sampling (see SessionConfig::sample_every).
+    metrics::LatencyHistogram request_latency_;
+    std::uint32_t orders_since_sample_ = 0;
+    // The account of the sample being timed with an asynchronous backend, or kNoOwner.
+    OwnerId sample_owner_ = kNoOwner;
+    std::uint32_t sample_dones_left_ = 0;  // request_done() calls until it is finished.
+    std::uint64_t sample_start_ = 0;       // In TickClock ticks.
 };
+
+// The single-threaded session layer of Phase 6, which owns the order entry layer.
+template <OrderBook Book>
+using SessionManager = BasicSessionManager<InlineBackend<Book>>;
 
 }  // namespace litbook::gateway

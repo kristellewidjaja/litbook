@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -41,7 +42,29 @@ struct GatewayConfig {
     Timestamp (*clock)() = &nanoseconds_since_midnight;
 };
 
-// A single-threaded, non-blocking TCP server in front of a SessionManager. It owns the
+// Extra work the gateway loop does for a threaded pipeline (see pipeline/reply_pump.hpp).
+// drain() runs once per round, after the reads and before the writes, and moves replies
+// that other threads produced into the session layer. wake_fd() is a descriptor that
+// becomes readable when such replies arrive, or -1 for none. Before a round that may
+// sleep in epoll_wait, prepare_to_sleep() is asked whether sleeping is allowed, and
+// woke_up() is called after such a sleep.
+template <class P>
+concept GatewayPump = requires(P& pump, const P& const_pump, Timestamp now) {
+    { pump.prepare_to_sleep() } -> std::same_as<bool>;
+    pump.woke_up();
+    pump.drain(now);
+    { const_pump.wake_fd() } -> std::same_as<int>;
+};
+
+// The pump of the single-threaded gateway, which has nothing extra to do.
+struct NoPump {
+    [[nodiscard]] static bool prepare_to_sleep() noexcept { return true; }
+    static void woke_up() noexcept {}
+    static void drain(Timestamp /*now*/) noexcept {}
+    [[nodiscard]] static int wake_fd() noexcept { return -1; }
+};
+
+// A single-threaded, non-blocking TCP server in front of a session layer. It owns the
 // sockets and moves bytes between them and the session layer, and the session layer
 // makes every protocol decision.
 //
@@ -56,17 +79,28 @@ struct GatewayConfig {
 // Every buffer and table is allocated in the constructor, so serving clients never
 // allocates. stop() may be called from any thread or from a signal handler.
 //
+// With a pump (a threaded pipeline), the replies come from another thread. The pump's
+// descriptor is watched too, so a sleeping loop wakes up when replies arrive, and every
+// round drains the replies before writing the sockets.
+//
 // These invariants hold between calls. A socket is stored for a ConnectionId exactly when
 // the session layer has that connection open, and the epoll interest recorded for it is
 // the one registered with the kernel.
-template <OrderBook Book>
-class EpollGateway {
+template <class Sessions, GatewayPump Pump = NoPump>
+class BasicEpollGateway {
 public:
-    using ConnectionId = typename SessionManager<Book>::ConnectionId;
+    using ConnectionId = typename Sessions::ConnectionId;
 
     // Opens the listening socket. Throws std::system_error if a system call fails.
-    EpollGateway(SessionManager<Book>& sessions, const GatewayConfig& config)
+    BasicEpollGateway(Sessions& sessions, const GatewayConfig& config)
+        requires std::same_as<Pump, NoPump>
+        : BasicEpollGateway(sessions, config, no_pump()) {}
+
+    // The same, with a pump that the gateway calls every round. The pump must outlive
+    // the gateway.
+    BasicEpollGateway(Sessions& sessions, const GatewayConfig& config, Pump& pump)
         : sessions_(&sessions),
+          pump_(&pump),
           config_(config),
           epoll_(::epoll_create1(EPOLL_CLOEXEC)),
           wake_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
@@ -80,18 +114,23 @@ public:
         listen_ = listen_tcp(config.address, config.port, config.backlog);
         watch(listen_.get(), EPOLLIN, kListenTag);
         watch(wake_.get(), EPOLLIN, kWakeTag);
+        if (pump.wake_fd() >= 0) {
+            watch(pump.wake_fd(), EPOLLIN, kPumpTag);
+        }
         last_tick_ = config_.clock();
     }
 
-    EpollGateway(const EpollGateway&) = delete;
-    EpollGateway& operator=(const EpollGateway&) = delete;
-    EpollGateway(EpollGateway&&) = delete;
-    EpollGateway& operator=(EpollGateway&&) = delete;
+    BasicEpollGateway(const BasicEpollGateway&) = delete;
+    BasicEpollGateway& operator=(const BasicEpollGateway&) = delete;
+    BasicEpollGateway(BasicEpollGateway&&) = delete;
+    BasicEpollGateway& operator=(BasicEpollGateway&&) = delete;
 
     // Closes every client connection and tells the session layer, so accounts with
     // cancel on disconnect get their orders canceled.
-    ~EpollGateway() {
-        const Timestamp now = config_.clock();
+    ~BasicEpollGateway() { close_all(config_.clock()); }
+
+    // Closes every client connection now, as if each client had hung up.
+    void close_all(Timestamp now) {
         for (ConnectionId id = 0; id < sockets_.size(); ++id) {
             if (sockets_[id].valid()) {
                 close_connection(id, CloseReason::PeerClosed, now);
@@ -105,8 +144,18 @@ public:
     // socket activity and handles it. Returns the number of epoll events handled, or -1
     // if epoll_wait failed for a reason other than a signal.
     int poll_once(int timeout_ms) {
+        // A loop that may sleep asks the pump first. If replies are already on their
+        // way, the pump says no and this round only looks without waiting.
+        bool may_sleep = timeout_ms != 0;
+        if (may_sleep && !pump_->prepare_to_sleep()) {
+            timeout_ms = 0;
+            may_sleep = false;
+        }
         const int n = ::epoll_wait(epoll_.get(), events_.data(), static_cast<int>(events_.size()),
                                    timeout_ms);
+        if (may_sleep) {
+            pump_->woke_up();
+        }
         if (n < 0) {
             return errno == EINTR ? 0 : -1;
         }
@@ -117,10 +166,13 @@ public:
                 accept_all(now);
             } else if (e.data.u64 == kWakeTag) {
                 drain_wake();
+            } else if (e.data.u64 == kPumpTag) {
+                continue;  // The pump's descriptor only wakes the loop. drain() is below.
             } else {
                 read_from(static_cast<ConnectionId>(e.data.u64), now);
             }
         }
+        pump_->drain(now);
         // A clock that went backwards (midnight) also runs tick() and starts over.
         if (now < last_tick_ || now - last_tick_ >= config_.tick_interval) {
             sessions_->tick(now);
@@ -130,11 +182,18 @@ public:
         return n;
     }
 
-    // Serves clients until stop() is called.
+    // Serves clients until stop() is called, sleeping in epoll_wait for at most one
+    // tick interval at a time.
     void run() {
         const auto timeout_ms = static_cast<int>(config_.tick_interval / 1'000'000);
+        run(timeout_ms < 1 ? 1 : timeout_ms);
+    }
+
+    // The same with a chosen epoll_wait timeout. A timeout of 0 never sleeps, so the
+    // loop spins on one core for the lowest latency.
+    void run(int timeout_ms) {
         while (!stopping_.load(std::memory_order_acquire)) {
-            if (poll_once(timeout_ms < 1 ? 1 : timeout_ms) < 0) {
+            if (poll_once(timeout_ms) < 0) {
                 return;
             }
         }
@@ -168,6 +227,13 @@ private:
     // the ConnectionId, and these two values (above any ConnectionId) mark the others.
     static constexpr std::uint64_t kListenTag = std::numeric_limits<std::uint64_t>::max();
     static constexpr std::uint64_t kWakeTag = kListenTag - 1;
+    static constexpr std::uint64_t kPumpTag = kListenTag - 2;
+
+    // The pump used when none is given. It has no state, so one shared object is enough.
+    static Pump& no_pump() noexcept {
+        static NoPump pump;
+        return pump;
+    }
 
     // Resets the eventfd so it is no longer readable. Its value (how many stop() calls
     // there were) does not matter, and a failed read only means it was already reset.
@@ -209,7 +275,7 @@ private:
                 (void)set_receive_buffer(socket.get(), config_.socket_receive_buffer);
             }
             const ConnectionId id = sessions_->open(now);
-            if (id == SessionManager<Book>::kNoConnection) {
+            if (id == Sessions::kNoConnection) {
                 continue;  // The Fd destructor closes the socket.
             }
             epoll_event e{};
@@ -334,7 +400,8 @@ private:
         --open_sockets_;
     }
 
-    SessionManager<Book>* sessions_;
+    Sessions* sessions_;
+    Pump* pump_;
     GatewayConfig config_;
     Fd epoll_;
     Fd wake_;  // An eventfd that stop() writes to, so a waiting epoll_wait returns.
@@ -347,5 +414,9 @@ private:
     std::uint32_t open_sockets_ = 0;
     std::atomic<bool> stopping_{false};
 };
+
+// The single-threaded gateway of Phase 6.
+template <OrderBook Book>
+using EpollGateway = BasicEpollGateway<SessionManager<Book>>;
 
 }  // namespace litbook::gateway

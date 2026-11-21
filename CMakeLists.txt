@@ -27,15 +27,20 @@ add_library(litbook STATIC
     src/book/fast_order_book.cpp
     src/book/map_order_book.cpp
     src/book/sorted_order_book.cpp
+    src/concurrency/thread_affinity.cpp
     src/engine/engine.cpp
     src/gateway/session.cpp
     src/gateway/socket.cpp
     src/gateway/soup.cpp
     src/itch/binary_file_reader.cpp
+    src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(litbook PRIVATE litbook::warnings)
+# The pipeline (Phase 7) starts threads, so everything that uses the library links the
+# system thread library.
+find_package(Threads REQUIRED)
+target_link_libraries(litbook PUBLIC Threads::Threads PRIVATE litbook::warnings)
 
 # Tests and benchmarks
 if(LITBOOK_BUILD_TESTS)
