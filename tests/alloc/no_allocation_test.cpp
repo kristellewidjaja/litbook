@@ -608,6 +608,8 @@ void expect_pipeline_never_allocates() {
     constexpr OwnerId kOwners = 4;
     const std::array<std::string_view, kOwners + 1> users{"", "ann", "ben", "cy", "dee"};
 
+    // The 20,000 frames give a little more than this many replies.
+    constexpr std::uint64_t kEnoughReplies = 15'000;
     const auto stream = testing::order_entry_stream(17, 20'000);
     std::vector<std::vector<std::byte>> packets;
     std::vector<OwnerId> owners;
@@ -671,9 +673,12 @@ void expect_pipeline_never_allocates() {
                 drain();
             }
         }
-        // Give the last replies a moment to come back before stopping.
-        for (int round = 0; round < 50; ++round) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Keep reading until enough replies came back. A fixed wait is not enough on a
+        // slow machine (CI runs this under ASan on two cores), because stop() does not
+        // serve input that is still waiting, so the count would depend on the machine.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (replies <= kEnoughReplies && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             drain();
         }
         exchange.stop();
@@ -681,8 +686,8 @@ void expect_pipeline_never_allocates() {
     }
     EXPECT_EQ(count, 0U);
     EXPECT_EQ(exchange.sessions().stats().logins_accepted, kOwners);
-    EXPECT_GT(exchange.sessions().stats().messages_out, 15'000U);
-    EXPECT_GT(replies, 15'000U);
+    EXPECT_GT(exchange.sessions().stats().messages_out, kEnoughReplies);
+    EXPECT_GT(replies, kEnoughReplies);
     EXPECT_GT(exchange.publisher().stats().trades, 500U);
     EXPECT_EQ(exchange.matching().order_entry().live_orders(), 0U);  // Cancel on disconnect.
 }
