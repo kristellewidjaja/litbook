@@ -36,6 +36,11 @@ add_executable(litbook_tests
     itch/binary_file_reader_test.cpp
     itch/book_builder_test.cpp
     itch/itch_parser_test.cpp
+    journal/crc32c_test.cpp
+    journal/journal_format_test.cpp
+    journal/journal_reader_test.cpp
+    journal/journal_writer_test.cpp
+    journal/replay_test.cpp
     metrics/latency_histogram_test.cpp
     pipeline/doorbell_test.cpp
     pipeline/feed_worker_test.cpp

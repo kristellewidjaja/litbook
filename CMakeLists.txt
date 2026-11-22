@@ -39,6 +39,11 @@ add_library(litbook STATIC
     src/gateway/socket.cpp
     src/gateway/soup.cpp
     src/itch/binary_file_reader.cpp
+    src/journal/crc32c.cpp
+    src/journal/journal_format.cpp
+    src/journal/journal_reader.cpp
+    src/journal/journal_writer.cpp
+    src/journal/replay.cpp
     src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)

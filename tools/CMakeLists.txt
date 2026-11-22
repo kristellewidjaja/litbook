@@ -18,6 +18,10 @@ target_link_libraries(litbook_gateway PRIVATE litbook::litbook litbook::warnings
 add_executable(litbook_feed_listener feed_listener.cpp)
 target_link_libraries(litbook_feed_listener PRIVATE litbook::litbook litbook::warnings)
 
+# Checks, prints and replays a journal (docs/JOURNAL.md).
+add_executable(litbook_journal journal_main.cpp)
+target_link_libraries(litbook_journal PRIVATE litbook::litbook litbook::warnings)
+
 # End-to-end tests that run the replay tool on a tiny generated ITCH day. They live in their
 # own executable so the main unit tests do not depend on the tools.
 if(LITBOOK_BUILD_TESTS)
@@ -25,15 +29,18 @@ if(LITBOOK_BUILD_TESTS)
     add_executable(litbook_tool_tests
         ${PROJECT_SOURCE_DIR}/tests/tools/itch_replay_smoke_test.cpp
         ${PROJECT_SOURCE_DIR}/tests/tools/gateway_smoke_test.cpp
-        ${PROJECT_SOURCE_DIR}/tests/tools/feed_listener_smoke_test.cpp)
+        ${PROJECT_SOURCE_DIR}/tests/tools/feed_listener_smoke_test.cpp
+        ${PROJECT_SOURCE_DIR}/tests/tools/journal_tool_smoke_test.cpp)
     target_include_directories(litbook_tool_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests)
     target_link_libraries(litbook_tool_tests PRIVATE
         litbook::litbook litbook::warnings GTest::gtest_main)
     target_compile_definitions(litbook_tool_tests PRIVATE
         LITBOOK_ITCH_REPLAY="$<TARGET_FILE:litbook_itch_replay>"
         LITBOOK_GATEWAY="$<TARGET_FILE:litbook_gateway>"
-        LITBOOK_FEED_LISTENER="$<TARGET_FILE:litbook_feed_listener>")
-    add_dependencies(litbook_tool_tests litbook_itch_replay litbook_gateway litbook_feed_listener)
+        LITBOOK_FEED_LISTENER="$<TARGET_FILE:litbook_feed_listener>"
+        LITBOOK_JOURNAL="$<TARGET_FILE:litbook_journal>")
+    add_dependencies(litbook_tool_tests litbook_itch_replay litbook_gateway litbook_feed_listener
+        litbook_journal)
     gtest_discover_tests(litbook_tool_tests
         DISCOVERY_MODE PRE_TEST
         PROPERTIES TIMEOUT 300)

@@ -35,4 +35,26 @@ constexpr void store_be(std::span<std::byte> bytes, std::size_t offset, T value)
     }
 }
 
+// Reads and writes unsigned integers in little-endian order (least significant byte
+// first). The wire protocols are big-endian, but the journal (docs/JOURNAL.md) is a local
+// file format, and every machine litbook runs on is little-endian, so its fields use this
+// order. The same rules as above apply. The value is built one byte at a time, so the
+// result does not depend on the CPU, and the caller checks the length first.
+template <std::unsigned_integral T>
+[[nodiscard]] constexpr T load_le(std::span<const std::byte> bytes, std::size_t offset) noexcept {
+    T value = 0;
+    for (std::size_t i = sizeof(T); i > 0; --i) {
+        value = static_cast<T>((value << 8U) | std::to_integer<T>(bytes[offset + i - 1]));
+    }
+    return value;
+}
+
+template <std::unsigned_integral T>
+constexpr void store_le(std::span<std::byte> bytes, std::size_t offset, T value) noexcept {
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        bytes[offset + i] = static_cast<std::byte>(value & 0xFFU);
+        value = static_cast<T>(value >> 8U);
+    }
+}
+
 }  // namespace litbook::protocol

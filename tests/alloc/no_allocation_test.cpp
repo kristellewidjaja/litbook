@@ -23,6 +23,9 @@
 #include "litbook/gateway/epoll_gateway.hpp"
 #include "litbook/gateway/session_manager.hpp"
 #include "litbook/gateway/soup.hpp"
+#include "litbook/journal/journal_reader.hpp"
+#include "litbook/journal/journal_writer.hpp"
+#include "litbook/journal/replay.hpp"
 #include "litbook/pipeline/feed_worker.hpp"
 #include "litbook/pipeline/threaded_gateway.hpp"
 #include "litbook/protocol/order_entry.hpp"
@@ -51,7 +54,9 @@
 #include "feed/feed_forwarder.hpp"
 #include "feed/lossy_channel.hpp"
 #include "gateway/test_client.hpp"
+#include "journal/replay_test_support.hpp"
 #include "protocol/order_entry_stream.hpp"
+#include "support/temp_dir.hpp"
 #include "support/unwrap.hpp"
 
 namespace {
@@ -888,6 +893,125 @@ TEST(NoAllocationTest, MarketDataFeedNeverAllocates) {
     for (feed::Locate l = 0; l < 2; ++l) {
         EXPECT_EQ(*handler.book(l), publisher.copy(l));
     }
+}
+
+}  // namespace
+}  // namespace litbook
+
+namespace litbook {
+namespace {
+
+// Market events counted in plain integers, so they do not allocate.
+class CountingMarketData final : public protocol::MarketDataSink {
+public:
+    void on_trade(SymbolId /*symbol*/, const Trade& /*trade*/) override { ++trades; }
+    void on_level_update(SymbolId /*symbol*/, const LevelUpdate& /*update*/) override { ++levels; }
+    std::uint64_t trades = 0;
+    std::uint64_t levels = 0;
+};
+
+// The journal writer is on the path of every request in Phase 9, so appending and
+// committing must not allocate once the writer exists. Its buffer is made in create().
+TEST(NoAllocationTest, JournalWriterNeverAllocatesWhileAppendingAndCommitting) {
+    const testing::TempDir dir;
+    const auto requests = journal::testing::replay_stream(3, 50'000);
+    journal::JournalWriterConfig config;
+    // Small enough that the buffer fills between the regular commits, so the full buffer
+    // path (commit, then append again) is covered too.
+    config.buffer_capacity = 1024;
+    journal::JournalWriter writer = journal::JournalWriter::create(dir.file("a.journal"), config);
+    std::uint64_t count = 0;
+    std::uint64_t full = 0;
+    {
+        const AllocationCounter counter;
+        int since_commit = 0;
+        for (const pipeline::Request& r : requests) {
+            journal::JournalStatus status = writer.append(r);
+            if (status == journal::JournalStatus::BufferFull) {
+                ++full;
+                status = writer.commit() == journal::JournalStatus::Ok ? writer.append(r) : status;
+            }
+            ASSERT_EQ(status, journal::JournalStatus::Ok);
+            if (++since_commit == 64) {
+                ASSERT_EQ(writer.commit(), journal::JournalStatus::Ok);
+                since_commit = 0;
+            }
+        }
+        ASSERT_EQ(writer.flush(), journal::JournalStatus::Ok);
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(writer.stats().records, 50'000U);
+    EXPECT_GT(writer.stats().commits, 700U);
+    EXPECT_GT(full, 100U);
+}
+
+// Scanning a journal and replaying its requests must not allocate either once the setup
+// records have built the order entry layer, so recovery has the same no-allocation
+// property as the matching thread.
+template <class Book>
+void expect_replay_never_allocates() {
+    const testing::TempDir dir;
+    const std::string path = dir.file("a.journal");
+    {
+        journal::JournalWriter writer = journal::JournalWriter::create(path, {});
+        ASSERT_EQ(writer.append_session_start(0, journal::testing::replay_order_entry_config()),
+                  journal::JournalStatus::Ok);
+        SymbolId id = 0;
+        for (const char* name : journal::testing::kReplayStocks) {
+            ASSERT_EQ(
+                writer.append_add_symbol(
+                    0, journal::SymbolListing{.id = id,
+                                              .ticker = testing::unwrap(make_ticker(name)),
+                                              .config = journal::testing::replay_book_config()}),
+                journal::JournalStatus::Ok);
+            ++id;
+        }
+        for (const pipeline::Request& r : journal::testing::replay_stream(4, 40'000)) {
+            if (writer.append(r) == journal::JournalStatus::BufferFull) {
+                ASSERT_EQ(writer.commit(), journal::JournalStatus::Ok);
+                ASSERT_EQ(writer.append(r), journal::JournalStatus::Ok);
+            }
+        }
+        ASSERT_EQ(writer.flush(), journal::JournalStatus::Ok);
+    }
+    const journal::MappedFile file(path);
+    CountingSink replies;
+    CountingMarketData events;
+    journal::Replayer<Book> replayer(replies, &events);
+    journal::RecordReader reader(file.bytes().subspan(journal::kFileHeaderLength));
+    journal::JournalRecord record;
+    // The setup records allocate the order entry layer and the books, as startup does.
+    for (std::size_t i = 0; i < 1 + journal::testing::kReplayStocks.size(); ++i) {
+        ASSERT_TRUE(reader.next(record));
+        ASSERT_EQ(replayer.apply(record), journal::ReplayStatus::Ok);
+    }
+    std::uint64_t count = 0;
+    journal::JournalScan scan;
+    {
+        const AllocationCounter counter;
+        scan = journal::scan_journal(file.bytes());
+        while (reader.next(record)) {
+            if (replayer.apply(record) != journal::ReplayStatus::Ok) {
+                break;
+            }
+        }
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(scan.tail, journal::TailStatus::Clean);
+    EXPECT_EQ(replayer.status(), journal::ReplayStatus::Ok);
+    EXPECT_EQ(replayer.stats().frames + replayer.stats().cancel_alls, 40'000U);
+    EXPECT_GT(events.trades, 1'000U);
+    EXPECT_GT(replies.frames, 40'000U);
+}
+
+TEST(NoAllocationTest, ReplayOverFastBooksNeverAllocatesAfterSetup) {
+    expect_replay_never_allocates<FastOrderBook>();
+}
+
+TEST(NoAllocationTest, ReplayOverSortedBooksNeverAllocatesAfterSetup) {
+    expect_replay_never_allocates<SortedOrderBook>();
 }
 
 }  // namespace

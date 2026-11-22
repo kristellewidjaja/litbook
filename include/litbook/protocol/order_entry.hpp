@@ -7,6 +7,7 @@
 #include "litbook/engine/engine_listener.hpp"
 #include "litbook/protocol/codec.hpp"
 #include "litbook/protocol/messages.hpp"
+#include "litbook/protocol/order_entry_config.hpp"
 #include "litbook/types.hpp"
 
 #include <array>
@@ -52,27 +53,6 @@ protected:
     MarketDataSink(MarketDataSink&&) = default;
     MarketDataSink& operator=(const MarketDataSink&) = default;
     MarketDataSink& operator=(MarketDataSink&&) = default;
-};
-
-// Pre-trade risk limits for one account. An Enter Order or Replace Order that breaks one
-// is refused before it reaches the book. The defaults are so large that they never apply.
-struct RiskLimits {
-    // The largest Quantity field an Enter Order or Replace Order may carry. For a replace
-    // this is the order's new total size, counting shares that already executed.
-    Qty max_order_qty = std::numeric_limits<Qty>::max();
-    // The most orders the account may have live at the same time.
-    std::uint32_t max_open_orders = std::numeric_limits<std::uint32_t>::max();
-    bool operator==(const RiskLimits&) const = default;
-};
-
-struct OrderEntryConfig {
-    // Accounts are numbered 1 to max_owners. Owner 0 is kNoOwner, which the books exempt
-    // from self-trade prevention, so it is never a real account.
-    OwnerId max_owners = 16;
-    // The most orders that can be live at once across all accounts and stocks.
-    std::uint32_t max_live_orders = 1U << 20U;
-    // The most stocks the engine may list.
-    std::size_t max_symbols = 1024;
 };
 
 // Counts of inbound messages that were dropped without any outbound message. OUCH drops
