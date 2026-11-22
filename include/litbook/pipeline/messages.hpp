@@ -73,8 +73,10 @@ enum class MarketEventKind : std::uint8_t {
 
 // From the matching thread to the publisher thread. A trade fills price, qty, side (the
 // aggressor's side) and match_id. A level update fills side, price, qty (the level's
-// total) and order_count.
+// total) and order_count. `now` is the timestamp of the request that caused the event, so
+// the market data feed depends only on the order of the requests.
 struct MarketEvent {
+    Timestamp now = 0;
     MarketEventKind kind = MarketEventKind::Trade;
     Side side = Side::Buy;
     SymbolId symbol = 0;

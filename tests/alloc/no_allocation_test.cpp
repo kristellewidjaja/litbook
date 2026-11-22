@@ -16,9 +16,14 @@
 #include "litbook/concurrency/spsc_queue.hpp"
 #include "litbook/engine/engine.hpp"
 #include "litbook/engine/engine_listener.hpp"
+#include "litbook/feed/feed_handler.hpp"
+#include "litbook/feed/feed_publisher.hpp"
+#include "litbook/feed/feed_receiver.hpp"
+#include "litbook/feed/udp_feed_sink.hpp"
 #include "litbook/gateway/epoll_gateway.hpp"
 #include "litbook/gateway/session_manager.hpp"
 #include "litbook/gateway/soup.hpp"
+#include "litbook/pipeline/feed_worker.hpp"
 #include "litbook/pipeline/threaded_gateway.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
@@ -36,12 +41,15 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "book/book_test_support.hpp"
 #include "book/workload.hpp"
 #include "concurrency/queue_test_support.hpp"
+#include "feed/feed_forwarder.hpp"
+#include "feed/lossy_channel.hpp"
 #include "gateway/test_client.hpp"
 #include "protocol/order_entry_stream.hpp"
 #include "support/unwrap.hpp"
@@ -602,9 +610,92 @@ namespace {
 // every allocation on the gateway, matching and publisher threads while they serve, and
 // during the shutdown (End of Session, cancel on disconnect, Stop). Starting the threads
 // happens before, because creating a thread allocates.
-template <pipeline::WaitMode Mode>
+// The feed side of the pipeline test. It owns the receiver, the sink the publisher sends
+// through, and a reader thread that reads the feed the whole time. The reader has its
+// own thread because stop() blocks the test thread while cancel on disconnect sends a
+// burst, and a receiver nobody reads during a burst loses its end.
+class FeedReader {
+public:
+    FeedReader() : receiver_(receiver_config()), sink_(network_config(receiver_)) {}
+
+    [[nodiscard]] pipeline::FeedWorkerOptions publisher_options() {
+        pipeline::FeedWorkerOptions o;
+        o.feed.session = "ALLOC";
+        o.feed.snapshot_spacing = 1'000'000;
+        o.sink = &sink_;
+        o.max_levels_per_side = 256;
+        return o;
+    }
+
+    // Called before counting starts, because making a thread allocates.
+    void start() {
+        thread_ = std::thread([this] {
+            while (!receiver_.handler().ended() && !give_up_.load()) {
+                receiver_.poll_once(1);
+            }
+            done_ = true;
+        });
+    }
+
+    // Waits a short while for End of Session, which may never come (see the test), then
+    // stops the reader thread.
+    void finish() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!done_.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        give_up_ = true;
+        thread_.join();
+    }
+
+    // Read this only after finish().
+    [[nodiscard]] const feed::FeedHandler& handler() const { return receiver_.handler(); }
+
+private:
+    static feed::FeedReceiverConfig receiver_config() {
+        feed::FeedReceiverConfig rc;
+        rc.incremental = {.address = "239.255.80.1", .port = 0};
+        rc.snapshot = {.address = "239.255.80.2", .port = 0};
+        rc.handler = feed::FeedHandlerConfig{.session = "ALLOC", .max_symbols = 4};
+        return rc;
+    }
+
+    static feed::FeedNetworkConfig network_config(const feed::FeedReceiver& receiver) {
+        feed::FeedNetworkConfig network;
+        network.incremental = {.address = "239.255.80.1", .port = receiver.incremental().port()};
+        network.snapshot = {.address = "239.255.80.2", .port = receiver.snapshot().port()};
+        return network;
+    }
+
+    feed::FeedReceiver receiver_;
+    feed::UdpFeedSink sink_;
+    std::thread thread_;
+    std::atomic<bool> done_{false};
+    std::atomic<bool> give_up_{false};
+};
+
+// The publisher's options. PublisherStub has none, FeedWorker gets the reader's sink.
+template <class Exchange>
+typename Exchange::PublisherOptions publisher_options_for(FeedReader* reader) {
+    if constexpr (std::is_same_v<typename Exchange::PublisherOptions,
+                                 pipeline::FeedWorkerOptions>) {
+        return reader->publisher_options();
+    } else {
+        return {};
+    }
+}
+
+// Runs the threaded pipeline over real sockets. With WithFeed its publisher thread runs
+// FeedWorker and sends the market data feed over multicast on lo, and a reader thread of
+// the test reads it with a FeedReceiver the whole time, inside the counted part too. The
+// reader has its own thread because stop() blocks the test thread while cancel on
+// disconnect sends a burst, and a receiver nobody reads during a burst loses its end.
+template <pipeline::WaitMode Mode, bool WithFeed>
 void expect_pipeline_never_allocates() {
-    using Exchange = pipeline::ThreadedGateway<SortedOrderBook, concurrency::SpscQueue>;
+    using FeedExchange = pipeline::BasicThreadedGateway<SortedOrderBook, concurrency::SpscQueue,
+                                                        pipeline::FeedWorker>;
+    using StubExchange = pipeline::ThreadedGateway<SortedOrderBook, concurrency::SpscQueue>;
+    using Exchange = std::conditional_t<WithFeed, FeedExchange, StubExchange>;
     constexpr OwnerId kOwners = 4;
     const std::array<std::string_view, kOwners + 1> users{"", "ann", "ben", "cy", "dee"};
 
@@ -630,9 +721,15 @@ void expect_pipeline_never_allocates() {
         (void)gateway::soup::encode_login_request(testing::unwrap(request), logins.at(owner));
     }
 
+    // Only the run with the feed has a reader. It is made before the exchange, because the
+    // publisher sends to the ports its receiver got.
+    const std::unique_ptr<FeedReader> reader =
+        WithFeed ? std::make_unique<FeedReader>() : std::unique_ptr<FeedReader>{};
+    const auto publisher_options = publisher_options_for<Exchange>(reader.get());
     Exchange exchange(gateway::SessionConfig{.max_connections = 8},
                       {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2},
-                      gateway::GatewayConfig{}, pipeline::PipelineConfig{.wait = Mode});
+                      gateway::GatewayConfig{}, pipeline::PipelineConfig{.wait = Mode},
+                      publisher_options);
     for (OwnerId owner = 1; owner <= kOwners; ++owner) {
         // Every account cancels on disconnect, so the shutdown has real work to do.
         exchange.add_account(
@@ -658,6 +755,9 @@ void expect_pipeline_never_allocates() {
             }
         }
     };
+    if (reader) {
+        reader->start();
+    }
 
     std::uint64_t count = 0;
     {
@@ -688,16 +788,106 @@ void expect_pipeline_never_allocates() {
     EXPECT_EQ(exchange.sessions().stats().logins_accepted, kOwners);
     EXPECT_GT(exchange.sessions().stats().messages_out, kEnoughReplies);
     EXPECT_GT(replies, kEnoughReplies);
-    EXPECT_GT(exchange.publisher().stats().trades, 500U);
     EXPECT_EQ(exchange.matching().order_entry().live_orders(), 0U);  // Cancel on disconnect.
+    if constexpr (WithFeed) {
+        reader->finish();
+        const feed::FeedHandler& handler = reader->handler();
+        EXPECT_GT(handler.stats().incremental_packets, 100U);
+        EXPECT_GT(exchange.publisher().feed().stats().snapshots, 0U);
+        // The feed is UDP, and this test is about allocations, not loss. Cancel on
+        // disconnect at the end sends a burst faster than the reader can empty its socket,
+        // so the tail of the feed and End of Session can be lost, and then nothing is
+        // left to show the gap. Only a handler that saw End of Session with nothing
+        // missing must have the feed's books.
+        if (handler.ended() && !handler.recovering()) {
+            for (feed::Locate l = 0; l < 2; ++l) {
+                EXPECT_EQ(*handler.book(l), exchange.publisher().feed().copy(l));
+            }
+        }
+    } else {
+        EXPECT_GT(exchange.publisher().stats().trades, 500U);
+    }
 }
 
 TEST(NoAllocationTest, SpinningPipelineNeverAllocatesWhileServing) {
-    expect_pipeline_never_allocates<pipeline::WaitMode::Spin>();
+    expect_pipeline_never_allocates<pipeline::WaitMode::Spin, false>();
 }
 
 TEST(NoAllocationTest, BlockingPipelineNeverAllocatesWhileServing) {
-    expect_pipeline_never_allocates<pipeline::WaitMode::Block>();
+    expect_pipeline_never_allocates<pipeline::WaitMode::Block, false>();
+}
+
+TEST(NoAllocationTest, SpinningPipelineWithTheFeedNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Spin, true>();
+}
+
+TEST(NoAllocationTest, BlockingPipelineWithTheFeedNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Block, true>();
+}
+
+// The market data path must not allocate either. Orders go through the order entry layer,
+// their market data through the publisher, and the packets through a channel that loses,
+// duplicates and reorders some of them into a feed handler, so gap detection, buffering,
+// snapshot assembly and recovery all run inside the counted region.
+TEST(NoAllocationTest, MarketDataFeedNeverAllocates) {
+    const auto stream = testing::order_entry_stream(17, 30'000);
+    feed::FeedHandler handler(feed::FeedHandlerConfig{
+        .session = "ALLOC", .max_symbols = 4, .max_levels_per_side = 256, .buffer_capacity = 4096});
+    feed::testing::LossyChannel channel(
+        handler, 17,
+        feed::testing::LossRates{.drop = 30, .duplicate = 20, .hold = 20, .snapshot_lag = 3});
+    feed::FeedPublisherConfig config;
+    config.session = "ALLOC";
+    config.snapshot_spacing = 20'000;
+    feed::FeedPublisher publisher(channel, config);
+    feed::testing::FeedForwarder forwarder(publisher);
+    feed::testing::DiscardReplies replies;
+    protocol::OrderEntry<SortedOrderBook> entry(
+        replies, {.max_owners = 4, .max_live_orders = 4096, .max_symbols = 2});
+    entry.set_market_data_sink(&forwarder);
+    for (const char* name : testing::kStreamStocks) {
+        const Ticker ticker = testing::unwrap(make_ticker(name));
+        entry.add_symbol(ticker, testing::with_test_limits(BookConfig{.tick_size = 100}));
+        publisher.add_symbol(
+            {.symbol = ticker, .tick_size = 100, .lot_size = 1, .max_levels_per_side = 256});
+    }
+
+    std::uint64_t count = 0;
+    {
+        const AllocationCounter counter;
+        feed::Timestamp now = 0;
+        publisher.start(now);
+        std::uint64_t frames = 0;
+        for (const testing::InboundFrame& frame : stream) {
+            now += 1'000;
+            forwarder.set_now(now);
+            (void)entry.on_frame(frame.owner, frame.bytes, now);
+            if (++frames % 3 == 0) {
+                publisher.flush(now);
+            }
+            if (frames % 10 == 0) {
+                publisher.tick(now);
+            }
+        }
+        channel.set_lossless();
+        now += config.heartbeat_interval;
+        publisher.tick(now);
+        for (int i = 0; i < 8; ++i) {
+            now += config.snapshot_spacing;
+            publisher.tick(now);
+        }
+        publisher.end_session(now);
+        count = counter.count();
+    }
+    EXPECT_EQ(count, 0U);
+    EXPECT_GT(handler.stats().gaps, 10U);
+    EXPECT_GT(handler.stats().snapshots_applied, 10U);
+    EXPECT_GT(handler.stats().replayed, 0U);
+    EXPECT_FALSE(handler.recovering());
+    EXPECT_TRUE(handler.ended());
+    for (feed::Locate l = 0; l < 2; ++l) {
+        EXPECT_EQ(*handler.book(l), publisher.copy(l));
+    }
 }
 
 }  // namespace

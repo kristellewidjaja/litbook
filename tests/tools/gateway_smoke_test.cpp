@@ -20,96 +20,26 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "gateway/soup_test_support.hpp"
 #include "gateway/test_client.hpp"
 #include "support/unwrap.hpp"
-
-extern char** environ;  // NOLINT(readability-redundant-declaration): posix_spawn needs it.
+#include "tools/child_process.hpp"
 
 namespace litbook::gateway {
 namespace {
 
 using testing::TestClient;
 
-// The gateway program running as a child process, with its standard output in a pipe.
-class GatewayProcess {
+// The gateway program as a child process.
+class GatewayProcess : public litbook::testing::ChildProcess {
 public:
-    explicit GatewayProcess(std::vector<std::string> args) {
-        args.insert(args.begin(), LITBOOK_GATEWAY);
-        std::array<int, 2> pipe_fds{};
-        if (::pipe(pipe_fds.data()) != 0) {
-            throw std::runtime_error("pipe failed");
-        }
-        posix_spawn_file_actions_t actions{};
-        posix_spawn_file_actions_init(&actions);
-        posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO);
-        posix_spawn_file_actions_addclose(&actions, pipe_fds[0]);
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 1);
-        for (std::string& a : args) {
-            argv.push_back(a.data());
-        }
-        argv.push_back(nullptr);
-        const int rc = posix_spawn(&pid_, args[0].c_str(), &actions, nullptr, argv.data(), environ);
-        posix_spawn_file_actions_destroy(&actions);
-        ::close(pipe_fds[1]);
-        if (rc != 0) {
-            ::close(pipe_fds[0]);
-            throw std::runtime_error("posix_spawn failed");
-        }
-        out_.reset(::fdopen(pipe_fds[0], "r"));
-    }
-
-    GatewayProcess(const GatewayProcess&) = delete;
-    GatewayProcess& operator=(const GatewayProcess&) = delete;
-    GatewayProcess(GatewayProcess&&) = delete;
-    GatewayProcess& operator=(GatewayProcess&&) = delete;
-
-    ~GatewayProcess() {
-        if (pid_ > 0) {
-            ::kill(pid_, SIGKILL);
-            ::waitpid(pid_, nullptr, 0);
-        }
-    }
-
-    // The next line the program printed, without its newline, or "" at the end.
-    std::string line() {
-        std::array<char, 512> buffer{};
-        if (std::fgets(buffer.data(), static_cast<int>(buffer.size()), out_.get()) == nullptr) {
-            return "";
-        }
-        std::string s(buffer.data());
-        if (!s.empty() && s.back() == '\n') {
-            s.pop_back();
-        }
-        return s;
-    }
-
-    // Reads the "listening on 127.0.0.1:PORT" line and returns the port.
-    std::uint16_t port() {
-        const std::string first = line();
-        const auto colon = first.rfind(':');
-        EXPECT_NE(colon, std::string::npos) << first;
-        EXPECT_NE(first.find("listening on 127.0.0.1:"), std::string::npos) << first;
-        return static_cast<std::uint16_t>(std::stoi(first.substr(colon + 1)));
-    }
-
-    // Sends a signal and returns the exit status, or -1 if it did not exit normally.
-    int stop(int signal) {
-        ::kill(pid_, signal);
-        int status = 0;
-        ::waitpid(pid_, &status, 0);
-        pid_ = -1;
-        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    }
-
-private:
-    pid_t pid_ = -1;
-    // The read end of the pipe as a FILE, closed by fclose when the object goes away.
-    std::unique_ptr<std::FILE, int (*)(std::FILE*)> out_{nullptr, &std::fclose};
+    explicit GatewayProcess(std::vector<std::string> args)
+        : ChildProcess(LITBOOK_GATEWAY, std::move(args)) {}
+    std::uint16_t port() { return litbook::testing::gateway_port(*this); }
 };
 
 // Reads from the client until a packet arrives or about two seconds pass.

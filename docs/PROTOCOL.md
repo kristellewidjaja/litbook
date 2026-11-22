@@ -4,6 +4,8 @@ This is the binary protocol clients use to enter, replace and cancel orders, and
 
 The codec lives in `include/litbook/protocol/codec.hpp` and `src/protocol/codec.cpp`. The session rules are implemented by the order entry layer in `include/litbook/protocol/order_entry.hpp`. The transport is SoupBinTCP 3.0, implemented in `include/litbook/gateway/soup.hpp` and `include/litbook/gateway/session_manager.hpp`.
 
+The market data feed, which tells everyone what the books look like, is described separately in [FEED.md](FEED.md).
+
 ## Transport: SoupBinTCP 3.0
 
 Messages travel over TCP inside SoupBinTCP 3.0 packets, as OUCH does at Nasdaq. This section follows Nasdaq's SoupBinTCP specification (version 3.00) and marks every rule litbook adds where the specification leaves a choice open.

@@ -1,7 +1,10 @@
 #pragma once
 
+#include "litbook/book/book_config.hpp"
 #include "litbook/concurrency/cpu_relax.hpp"
 #include "litbook/concurrency/message_queue.hpp"
+#include "litbook/engine/engine_listener.hpp"
+#include "litbook/engine/ticker.hpp"
 #include "litbook/pipeline/doorbell.hpp"
 #include "litbook/pipeline/messages.hpp"
 
@@ -19,20 +22,36 @@ struct PublisherStats {
     std::uint64_t checksum = 0;
 };
 
-// The publisher thread's side of the pipeline, for now only a consumer that counts what
-// it receives. In Phase 8 it turns the events into the UDP market data feed, and in
-// Phase 9 it also writes the journal. It exists already so the matching thread has a
-// real third consumer to keep fed, and so the event stream can be tested.
+// A publisher thread that only counts what it receives. It is the default publisher of
+// ThreadedGateway, for runs that need no market data feed. FeedWorker (feed_worker.hpp)
+// is the one that publishes the real feed. Both have the same constructor, add_symbol,
+// step, run and stopped, so ThreadedGateway can run either one.
 //
 // Invariants. Exactly one thread calls step or run, and it is the only consumer of the
 // event queue. After Stop, stopped() is true and nothing more is popped.
 template <concurrency::MessageQueue EventQueue>
-    requires std::same_as<typename EventQueue::value_type, MarketEvent>
 class PublisherStub {
+    // A static_assert and not a requires clause, so the template has exactly the shape
+    // BasicThreadedGateway's Publisher parameter asks for.
+    static_assert(std::same_as<typename EventQueue::value_type, MarketEvent>,
+                  "the publisher consumes MarketEvents");
+
 public:
+    // The stub needs no options. The type exists so ThreadedGateway can build any publisher
+    // the same way.
+    struct Options {};
+
     // `bell` wakes this thread in WaitMode::Block, and is nullptr when it spins.
     PublisherStub(EventQueue& events, WaitMode mode, Doorbell* bell)
         : events_(&events), mode_(mode), bell_(bell) {}
+
+    // The constructor ThreadedGateway uses. The stub reads no clock and has no options.
+    PublisherStub(EventQueue& events, WaitMode mode, Doorbell* bell, Timestamp (* /*clock*/)(),
+                  const Options& /*options*/)
+        : PublisherStub(events, mode, bell) {}
+
+    // The stub publishes nothing per stock, so there is nothing to list.
+    void add_symbol(SymbolId /*id*/, Ticker /*ticker*/, const BookConfig& /*config*/) noexcept {}
 
     // Pops and handles one event. Returns false if the queue was empty or the publisher
     // has already stopped.

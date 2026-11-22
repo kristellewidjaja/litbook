@@ -19,6 +19,14 @@ add_executable(litbook_tests
     concurrency/thread_affinity_test.cpp
     engine/engine_test.cpp
     engine/ticker_test.cpp
+    feed/feed_codec_test.cpp
+    feed/feed_handler_test.cpp
+    feed/feed_publisher_test.cpp
+    feed/feed_receiver_test.cpp
+    feed/level_book_test.cpp
+    feed/lossy_feed_test.cpp
+    feed/mold_test.cpp
+    feed/multicast_test.cpp
     gateway/byte_buffer_test.cpp
     gateway/epoll_gateway_test.cpp
     gateway/session_manager_async_test.cpp
@@ -30,11 +38,13 @@ add_executable(litbook_tests
     itch/itch_parser_test.cpp
     metrics/latency_histogram_test.cpp
     pipeline/doorbell_test.cpp
+    pipeline/feed_worker_test.cpp
     pipeline/manual_pipeline_test.cpp
     pipeline/matching_worker_test.cpp
     pipeline/messages_test.cpp
     pipeline/queue_backend_test.cpp
     pipeline/reply_pump_test.cpp
+    pipeline/threaded_feed_test.cpp
     pipeline/threaded_gateway_test.cpp
     protocol/byte_order_test.cpp
     protocol/codec_test.cpp

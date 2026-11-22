@@ -3,7 +3,6 @@
 #include "litbook/concurrency/message_queue.hpp"
 #include "litbook/pipeline/doorbell.hpp"
 #include "litbook/pipeline/messages.hpp"
-#include "litbook/protocol/messages.hpp"
 
 #include <concepts>
 #include <cstddef>
@@ -57,7 +56,7 @@ public:
 
     [[nodiscard]] int wake_fd() const noexcept { return bell_ == nullptr ? -1 : bell_->fd(); }
 
-    void drain(protocol::Timestamp now) {
+    void drain(Timestamp now) {
         std::size_t handled = 0;
         while (handled < max_batch_) {
             const Reply* reply = replies_->front();

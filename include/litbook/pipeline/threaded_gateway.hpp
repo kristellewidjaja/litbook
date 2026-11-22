@@ -63,8 +63,19 @@ enum class PipelineThread : std::uint8_t { Gateway, Matching, Publisher };
 // Invariants. Before start() and after stop() only the calling thread touches anything.
 // In between each queue has exactly one producer thread and one consumer thread, and the
 // gateway thread never waits for the matching thread.
-template <OrderBook Book, template <concurrency::QueueElement> class Queue>
-class ThreadedGateway {
+//
+// The publisher thread runs Publisher<Queue<MarketEvent>>. ThreadedGateway (below) uses
+// PublisherStub, which only counts the events, and FeedWorker publishes the market data
+// feed. Each stock is listed with the publisher right after the engine, so the feed's
+// locates are the engine's symbol ids.
+//
+// Publisher is a template, not a finished type, so that callers never have to write
+// Queue<MarketEvent> themselves. Clang 21 crashes when that is written inside a partial
+// specialization whose Queue is a constrained template template parameter, which is how
+// the typed tests pick their queue.
+template <OrderBook Book, template <concurrency::QueueElement> class Queue,
+          template <concurrency::MessageQueue> class PublisherTemplate>
+class BasicThreadedGateway {
 public:
     using Requests = Queue<Request>;
     using Replies = Queue<Reply>;
@@ -74,17 +85,22 @@ public:
     using Pump = ReplyPump<Sessions, Replies>;
     using Gateway = gateway::BasicEpollGateway<Sessions, Pump>;
     using Worker = MatchingWorker<Book, Requests, Replies, Events>;
-    using Publisher = PublisherStub<Events>;
+    using Publisher = PublisherTemplate<Events>;
+    using PublisherOptions = typename Publisher::Options;
 
     // Opens the listening socket. Throws std::invalid_argument for a bad configuration
     // or queue capacity, and std::system_error if a socket or eventfd cannot be made.
-    ThreadedGateway(const gateway::SessionConfig& session, const protocol::OrderEntryConfig& orders,
-                    const gateway::GatewayConfig& network, const PipelineConfig& pipeline)
+    // The publisher reads the same clock as the gateway (network.clock).
+    BasicThreadedGateway(const gateway::SessionConfig& session,
+                         const protocol::OrderEntryConfig& orders,
+                         const gateway::GatewayConfig& network, const PipelineConfig& pipeline,
+                         const PublisherOptions& publisher_options = {})
         : requests_(pipeline.request_capacity),
           replies_(pipeline.reply_capacity),
           events_(pipeline.event_capacity),
           worker_(orders, requests_, replies_, events_, pipeline.wait, bells_for(pipeline.wait)),
-          publisher_(events_, pipeline.wait, bells_for(pipeline.wait).events),
+          publisher_(events_, pipeline.wait, bells_for(pipeline.wait).events, network.clock,
+                     publisher_options),
           sessions_(session, std::in_place, worker_.order_entry(), requests_,
                     bells_for(pipeline.wait).requests),
           pump_(sessions_, replies_, bells_for(pipeline.wait).replies,
@@ -93,14 +109,14 @@ public:
           pipeline_(pipeline),
           clock_(network.clock) {}
 
-    ThreadedGateway(const ThreadedGateway&) = delete;
-    ThreadedGateway& operator=(const ThreadedGateway&) = delete;
-    ThreadedGateway(ThreadedGateway&&) = delete;
-    ThreadedGateway& operator=(ThreadedGateway&&) = delete;
+    BasicThreadedGateway(const BasicThreadedGateway&) = delete;
+    BasicThreadedGateway& operator=(const BasicThreadedGateway&) = delete;
+    BasicThreadedGateway(BasicThreadedGateway&&) = delete;
+    BasicThreadedGateway& operator=(BasicThreadedGateway&&) = delete;
 
     // Stops the threads if they still run. An error from a thread is lost here, so call
     // stop() first to see it.
-    ~ThreadedGateway() {
+    ~BasicThreadedGateway() {
         try {
             stop();
         } catch (...) {  // NOLINT(bugprone-empty-catch) A destructor must not throw.
@@ -108,22 +124,35 @@ public:
     }
 
     // Startup calls. Both throw std::logic_error after start(), because the threads then
-    // own the state they change.
+    // own the state they change. If the publisher refuses a stock that the engine already
+    // listed, add_symbol throws and the pipeline can no longer start, because the feed and
+    // the engine would disagree about the stocks.
     OwnerId add_account(const gateway::AccountConfig& account) {
         require_not_started();
         return sessions_.add_account(account);
     }
     SymbolId add_symbol(Ticker ticker, const BookConfig& config) {
         require_not_started();
-        return sessions_.add_symbol(ticker, config);
+        const SymbolId id = sessions_.add_symbol(ticker, config);
+        try {
+            publisher_.add_symbol(id, ticker, config);
+        } catch (...) {
+            setup_failed_ = true;
+            throw;
+        }
+        return id;
     }
 
     [[nodiscard]] std::uint16_t port() const { return gateway_.port(); }
 
     // Launches the publisher, matching and gateway threads. Throws std::logic_error if
-    // called twice, and std::system_error if a thread cannot be created.
+    // called twice or after a failed add_symbol, and std::system_error if a thread cannot
+    // be created.
     void start() {
         require_not_started();
+        if (setup_failed_) {
+            throw std::logic_error("a stock could not be listed with the publisher");
+        }
         started_ = true;
         publisher_thread_ = std::thread([this] { publisher_main(); });
         matching_thread_ = std::thread([this] { matching_main(); });
@@ -281,6 +310,11 @@ private:
     std::array<std::exception_ptr, 3> errors_{};
     bool started_ = false;
     bool joined_ = false;
+    bool setup_failed_ = false;
 };
+
+// The pipeline without a market data feed, as in Phase 7.
+template <OrderBook Book, template <concurrency::QueueElement> class Queue>
+using ThreadedGateway = BasicThreadedGateway<Book, Queue, PublisherStub>;
 
 }  // namespace litbook::pipeline

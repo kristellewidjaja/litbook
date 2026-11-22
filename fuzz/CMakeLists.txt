@@ -3,6 +3,7 @@
 #   book_fuzzer      differential test of all three books against the naive oracle
 #   protocol_fuzzer  decoder robustness and canonical re-encoding of the wire codec
 #   session_fuzzer   the SoupBinTCP session layer fed random bytes, splits and timing
+#   feed_fuzzer      the market data feed handler fed raw packets, and recovery over a lossy channel
 # With the `fuzz` preset (Clang only) each target gets a libFuzzer executable. In every
 # other preset a replay executable runs the saved inputs in its seeds and regressions
 # folders as a normal test.
@@ -24,6 +25,13 @@ target_include_directories(litbook_session_fuzz_target
 target_link_libraries(litbook_session_fuzz_target
     PUBLIC litbook::litbook PRIVATE litbook::warnings)
 
+add_library(litbook_feed_fuzz_target STATIC feed_fuzzer.cpp)
+target_include_directories(litbook_feed_fuzz_target
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/tests)  # for the lossy channel and unwrap
+target_link_libraries(litbook_feed_fuzz_target
+    PUBLIC litbook::litbook PRIVATE litbook::warnings)
+
 if(LITBOOK_FUZZ)
     add_executable(book_fuzzer libfuzzer_main.cpp)
     target_link_libraries(book_fuzzer PRIVATE litbook_fuzz_target litbook::warnings)
@@ -36,6 +44,10 @@ if(LITBOOK_FUZZ)
     add_executable(session_fuzzer libfuzzer_main.cpp)
     target_link_libraries(session_fuzzer PRIVATE litbook_session_fuzz_target litbook::warnings)
     target_link_options(session_fuzzer PRIVATE -fsanitize=fuzzer)
+
+    add_executable(feed_fuzzer libfuzzer_main.cpp)
+    target_link_libraries(feed_fuzzer PRIVATE litbook_feed_fuzz_target litbook::warnings)
+    target_link_options(feed_fuzzer PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(LITBOOK_BUILD_TESTS)
@@ -64,4 +76,13 @@ if(LITBOOK_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/session_seeds
             ${CMAKE_CURRENT_SOURCE_DIR}/session_regressions)
     set_tests_properties(SessionFuzzCorpusReplay PROPERTIES TIMEOUT 300)
+
+    add_executable(litbook_feed_fuzz_replay replay_main.cpp)
+    target_link_libraries(litbook_feed_fuzz_replay
+        PRIVATE litbook_feed_fuzz_target litbook::warnings)
+    add_test(NAME FeedFuzzCorpusReplay
+        COMMAND litbook_feed_fuzz_replay
+            ${CMAKE_CURRENT_SOURCE_DIR}/feed_seeds
+            ${CMAKE_CURRENT_SOURCE_DIR}/feed_regressions)
+    set_tests_properties(FeedFuzzCorpusReplay PROPERTIES TIMEOUT 300)
 endif()

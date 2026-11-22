@@ -2,7 +2,8 @@ add_executable(litbook_bench
     hello_bench.cpp
     book_bench.cpp
     protocol_bench.cpp
-    queue_bench.cpp)
+    queue_bench.cpp
+    feed_bench.cpp)
 
 # The book benchmarks replay streams from the randomized-test workload generator.
 target_include_directories(litbook_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests)
@@ -83,4 +84,32 @@ if(LITBOOK_BUILD_TESTS)
     # The detail lines must really be printed, one per pass.
     set_tests_properties(QueueLatencyDetailSmokeTest PROPERTIES
                          PASS_REGULAR_EXPRESSION "pass 5: p50 [0-9]+ ns.*helper CPU 0 to 0")
+endif()
+
+# From an order on TCP to its price level on the multicast feed (see the top of the file).
+add_executable(litbook_feed_latency feed_latency.cpp)
+target_link_libraries(litbook_feed_latency PRIVATE litbook::litbook litbook::warnings)
+
+if(LITBOOK_BUILD_TESTS)
+    add_test(NAME FeedLatencySpinSmokeTest COMMAND litbook_feed_latency 200 spin)
+    add_test(NAME FeedLatencyBlockingSmokeTest COMMAND litbook_feed_latency 200 blocking)
+    # A run that lost a packet or left an order behind is not a clean measurement.
+    set_tests_properties(FeedLatencySpinSmokeTest FeedLatencyBlockingSmokeTest PROPERTIES
+        TIMEOUT 300
+        PASS_REGULAR_EXPRESSION "health: live orders 0, level updates applied [0-9]+, gaps 0, recoveries 0, dropped by sender 0, ended yes")
+endif()
+
+# How long a late joiner needs to be in step, against the number of stocks.
+add_executable(litbook_feed_recovery feed_recovery.cpp)
+target_link_libraries(litbook_feed_recovery PRIVATE litbook::litbook litbook::warnings)
+
+if(LITBOOK_BUILD_TESTS)
+    add_test(NAME FeedRecoverySmokeTest COMMAND litbook_feed_recovery 8 --runs 3)
+    add_test(NAME FeedRecoverySpinSmokeTest COMMAND litbook_feed_recovery 4 --runs 2 --spin
+                                                    --spacing-us 200)
+    set_tests_properties(FeedRecoverySmokeTest FeedRecoverySpinSmokeTest PROPERTIES
+        TIMEOUT 300
+        PASS_REGULAR_EXPRESSION "time to in step \\(ms\\): median [0-9.]+")
+    add_test(NAME FeedRecoveryRejectsBadArguments COMMAND litbook_feed_recovery 0)
+    set_tests_properties(FeedRecoveryRejectsBadArguments PROPERTIES WILL_FAIL TRUE)
 endif()

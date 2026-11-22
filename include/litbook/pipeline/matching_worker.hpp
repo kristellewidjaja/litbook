@@ -121,6 +121,9 @@ public:
 
 private:
     void handle(const Request& request) {
+        // The book events this request causes reach on_trade and on_level_update, which
+        // have no timestamp argument, so the request's time is kept here for them.
+        now_ = request.now;
         switch (request.kind) {
             case RequestKind::Frame:
                 ++stats_.frames;
@@ -138,6 +141,7 @@ private:
                 // The publisher gets its Stop first, so by the time the gateway sees
                 // Stopped, nothing more will be pushed to either queue.
                 MarketEvent stop;
+                stop.now = request.now;
                 stop.kind = MarketEventKind::Stop;
                 push_event(stop);
                 push_reply(make_stopped_reply());
@@ -165,6 +169,7 @@ private:
 
     void on_trade(SymbolId symbol, const Trade& trade) override {
         MarketEvent e;
+        e.now = now_;
         e.kind = MarketEventKind::Trade;
         e.side = trade.aggressor_side;
         e.symbol = symbol;
@@ -176,6 +181,7 @@ private:
 
     void on_level_update(SymbolId symbol, const LevelUpdate& update) override {
         MarketEvent e;
+        e.now = now_;
         e.kind = MarketEventKind::LevelUpdate;
         e.side = update.side;
         e.symbol = symbol;
@@ -223,6 +229,7 @@ private:
     WaitMode mode_;
     Doorbells bells_;
     MatchingStats stats_;
+    Timestamp now_ = 0;  // The time of the request being handled.
     bool stopped_ = false;
 };
 

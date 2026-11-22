@@ -29,6 +29,12 @@ add_library(litbook STATIC
     src/book/sorted_order_book.cpp
     src/concurrency/thread_affinity.cpp
     src/engine/engine.cpp
+    src/feed/feed_codec.cpp
+    src/feed/feed_handler.cpp
+    src/feed/feed_publisher.cpp
+    src/feed/feed_receiver.cpp
+    src/feed/mold.cpp
+    src/feed/multicast.cpp
     src/gateway/session.cpp
     src/gateway/socket.cpp
     src/gateway/soup.cpp
