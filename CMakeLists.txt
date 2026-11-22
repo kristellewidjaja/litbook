@@ -44,6 +44,7 @@ add_library(litbook STATIC
     src/journal/journal_reader.cpp
     src/journal/journal_writer.cpp
     src/journal/replay.cpp
+    src/journal/setup.cpp
     src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)

@@ -695,7 +695,9 @@ typename Exchange::PublisherOptions publisher_options_for(FeedReader* reader) {
 // the test reads it with a FeedReceiver the whole time, inside the counted part too. The
 // reader has its own thread because stop() blocks the test thread while cancel on
 // disconnect sends a burst, and a receiver nobody reads during a burst loses its end.
-template <pipeline::WaitMode Mode, bool WithFeed>
+// With WithJournal the pipeline also has its journal thread, which writes every request
+// to a journal file in a temporary directory before the matching thread sees it.
+template <pipeline::WaitMode Mode, bool WithFeed, bool WithJournal = false>
 void expect_pipeline_never_allocates() {
     using FeedExchange = pipeline::BasicThreadedGateway<SortedOrderBook, concurrency::SpscQueue,
                                                         pipeline::FeedWorker>;
@@ -731,10 +733,12 @@ void expect_pipeline_never_allocates() {
     const std::unique_ptr<FeedReader> reader =
         WithFeed ? std::make_unique<FeedReader>() : std::unique_ptr<FeedReader>{};
     const auto publisher_options = publisher_options_for<Exchange>(reader.get());
+    const testing::TempDir dir;
+    const pipeline::JournalOptions journal{.path = dir.file("alloc.journal")};
     Exchange exchange(gateway::SessionConfig{.max_connections = 8},
                       {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2},
                       gateway::GatewayConfig{}, pipeline::PipelineConfig{.wait = Mode},
-                      publisher_options);
+                      publisher_options, WithJournal ? &journal : nullptr);
     for (OwnerId owner = 1; owner <= kOwners; ++owner) {
         // Every account cancels on disconnect, so the shutdown has real work to do.
         exchange.add_account(
@@ -794,6 +798,14 @@ void expect_pipeline_never_allocates() {
     EXPECT_GT(exchange.sessions().stats().messages_out, kEnoughReplies);
     EXPECT_GT(replies, kEnoughReplies);
     EXPECT_EQ(exchange.matching().order_entry().live_orders(), 0U);  // Cancel on disconnect.
+    if constexpr (WithJournal) {
+        ASSERT_NE(exchange.journal(), nullptr);
+        EXPECT_FALSE(exchange.journal()->failed());
+        EXPECT_EQ(exchange.journal()->stats().forwarded, exchange.matching().stats().requests);
+        EXPECT_GT(exchange.journal()->writer().stats().records, kEnoughReplies / 2);
+    } else {
+        EXPECT_EQ(exchange.journal(), nullptr);
+    }
     if constexpr (WithFeed) {
         reader->finish();
         const feed::FeedHandler& handler = reader->handler();
@@ -828,6 +840,18 @@ TEST(NoAllocationTest, SpinningPipelineWithTheFeedNeverAllocatesWhileServing) {
 
 TEST(NoAllocationTest, BlockingPipelineWithTheFeedNeverAllocatesWhileServing) {
     expect_pipeline_never_allocates<pipeline::WaitMode::Block, true>();
+}
+
+TEST(NoAllocationTest, SpinningPipelineWithTheJournalNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Spin, false, true>();
+}
+
+TEST(NoAllocationTest, BlockingPipelineWithTheJournalNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Block, false, true>();
+}
+
+TEST(NoAllocationTest, BlockingPipelineWithTheFeedAndTheJournalNeverAllocatesWhileServing) {
+    expect_pipeline_never_allocates<pipeline::WaitMode::Block, true, true>();
 }
 
 // The market data path must not allocate either. Orders go through the order entry layer,

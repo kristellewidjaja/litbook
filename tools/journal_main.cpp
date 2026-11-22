@@ -128,12 +128,13 @@ int verify(const std::string& path) {
     }
     const std::uint64_t setup = counts[RecordType::SessionStart] + counts[RecordType::AddSymbol] +
                                 counts[RecordType::RiskLimits];
-    std::printf("records %llu (setup %llu, frames %llu, cancel alls %llu, stops %llu)\n",
-                static_cast<unsigned long long>(scan.records),
-                static_cast<unsigned long long>(setup),
-                static_cast<unsigned long long>(counts[RecordType::Frame]),
-                static_cast<unsigned long long>(counts[RecordType::CancelAll]),
-                static_cast<unsigned long long>(counts[RecordType::Stop]));
+    std::printf(
+        "records %llu (setup %llu, frames %llu, cancel alls %llu, stops %llu, restarts %llu)\n",
+        static_cast<unsigned long long>(scan.records), static_cast<unsigned long long>(setup),
+        static_cast<unsigned long long>(counts[RecordType::Frame]),
+        static_cast<unsigned long long>(counts[RecordType::CancelAll]),
+        static_cast<unsigned long long>(counts[RecordType::Stop]),
+        static_cast<unsigned long long>(counts[RecordType::Restart]));
     if (scan.records > 0) {
         std::printf("sequences %llu to %llu\n",
                     static_cast<unsigned long long>(scan.first_sequence),
@@ -188,6 +189,7 @@ void print_record(const JournalRecord& r) {
             std::printf(" owner %u", r.owner);
             break;
         case RecordType::Stop:
+        case RecordType::Restart:
             break;
     }
     std::printf("\n");
@@ -287,11 +289,12 @@ int replay(const std::string& path) {
     const ReplayStats& s = replayer.stats();
     std::printf(
         "replayed %llu records (setup %llu, frames %llu, malformed %llu, cancel alls %llu, "
-        "stops %llu) through sequence %llu\n",
+        "stops %llu, restarts %llu) through sequence %llu\n",
         static_cast<unsigned long long>(s.records),
         static_cast<unsigned long long>(s.setup_records), static_cast<unsigned long long>(s.frames),
         static_cast<unsigned long long>(s.malformed_frames),
         static_cast<unsigned long long>(s.cancel_alls), static_cast<unsigned long long>(s.stops),
+        static_cast<unsigned long long>(s.restarts),
         static_cast<unsigned long long>(s.last_sequence));
     std::printf("replies %llu crc32c %08x\n", static_cast<unsigned long long>(replies.count()),
                 replies.crc());

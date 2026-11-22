@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -139,6 +140,49 @@ TEST_F(FeedPublisherTest, ASnapshotIsTheCopyAsOfTheLastIncrementalMessage) {
     EXPECT_EQ(std::get<LevelUpdateMessage>(s.messages[5]).price, 10'200);
     EXPECT_EQ(s.messages[6], FeedMessage(SnapshotEnd{.timestamp = 7, .locate = 0, .as_of = 7}));
     EXPECT_EQ(publisher_.stats().snapshots, 1U);
+}
+
+TEST_F(FeedPublisherTest, RestoredLevelsAreSentInTheFirstSnapshotAndNowhereElse) {
+    publisher_.restore(level_event(0, Side::Buy, 10'000, 20, 2));
+    publisher_.restore(level_event(0, Side::Sell, 10'100, 6, 1));
+    publisher_.restore(level_event(0, Side::Sell, 10'100, 0, 0));  // Removed again.
+    publisher_.restore(level_event(0, Side::Sell, 10'200, 5, 1));
+    publisher_.restore(trade_event(0, Side::Buy, 10'000, 3, 1));  // Trades are ignored.
+    publisher_.restore(level_event(9, Side::Buy, 10'000, 1, 1));  // No such stock.
+    EXPECT_TRUE(sink_.packets.empty());
+    EXPECT_EQ(publisher_.stats().events, 0U);
+
+    publisher_.start(0);
+    publisher_.tick(7);
+    ASSERT_EQ(sink_.packets.size(), 2U);
+    EXPECT_EQ(decode_packet(sink_.packets[0].bytes).messages.size(), 3U);  // Only the start.
+    const DecodedPacket s = decode_packet(sink_.packets[1].bytes);
+    ASSERT_EQ(s.messages.size(), 5U);
+    EXPECT_EQ(std::get<SnapshotStart>(s.messages[1]).level_count, 2U);
+    EXPECT_EQ(std::get<LevelUpdateMessage>(s.messages[2]).price, 10'000);
+    EXPECT_EQ(std::get<LevelUpdateMessage>(s.messages[2]).total_qty, 20U);
+    EXPECT_EQ(std::get<LevelUpdateMessage>(s.messages[3]).price, 10'200);
+}
+
+TEST_F(FeedPublisherTest, ARenamedSessionIsWhatEveryPacketCarries) {
+    publisher_.rename_session("42");
+    EXPECT_EQ(publisher_.session(), "42");
+    publisher_.start(0);
+    publisher_.tick(7);
+    ASSERT_EQ(sink_.packets.size(), 2U);
+    for (const auto& packet : sink_.packets) {
+        const DecodedPacket p = decode_packet(packet.bytes);
+        EXPECT_EQ(std::string(p.header.session.begin(), p.header.session.end()), "        42");
+    }
+}
+
+TEST_F(FeedPublisherTest, RecoveryCallsAreOnlyAllowedBeforeStart) {
+    EXPECT_THROW(publisher_.rename_session(""), std::invalid_argument);
+    EXPECT_THROW(publisher_.rename_session("TOO-LONG-NAME"), std::invalid_argument);
+    EXPECT_EQ(publisher_.session(), "TEST1");
+    publisher_.start(0);
+    EXPECT_THROW(publisher_.rename_session("2"), std::logic_error);
+    EXPECT_THROW(publisher_.restore(level_event(0, Side::Buy, 10'000, 1, 1)), std::logic_error);
 }
 
 TEST_F(FeedPublisherTest, SnapshotsCycleThroughTheStocksAtTheirSpacing) {

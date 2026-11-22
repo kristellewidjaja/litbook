@@ -75,6 +75,7 @@ bool is_known_type(std::uint8_t letter) noexcept {
         case RecordType::Frame:
         case RecordType::CancelAll:
         case RecordType::Stop:
+        case RecordType::Restart:
             return true;
     }
     return false;
@@ -93,12 +94,13 @@ bool payload_length_fits(RecordType type, std::size_t length) noexcept {
             return length >= 1 && length <= kMaxPayload;
         case RecordType::CancelAll:
         case RecordType::Stop:
+        case RecordType::Restart:
             return length == 0;
     }
     return false;
 }
 
-// Setup records and Stop belong to no account, risk limits belong to a real account, and
+// Setup records, Stop and Restart belong to no account, risk limits belong to a real account, and
 // frames and cancels may name any owner, because replay must see exactly what the
 // matching thread saw (the order entry layer counts a bad owner itself).
 bool owner_fits(RecordType type, OwnerId owner) noexcept {
@@ -106,6 +108,7 @@ bool owner_fits(RecordType type, OwnerId owner) noexcept {
         case RecordType::SessionStart:
         case RecordType::AddSymbol:
         case RecordType::Stop:
+        case RecordType::Restart:
             return owner == kNoOwner;
         case RecordType::RiskLimits:
             return owner != kNoOwner;
@@ -183,6 +186,7 @@ bool payload_is_valid(RecordType type, std::span<const std::byte> payload) noexc
         case RecordType::Frame:
         case RecordType::CancelAll:
         case RecordType::Stop:
+        case RecordType::Restart:
             return true;  // Every value of their fields is allowed.
     }
     return false;
@@ -325,6 +329,10 @@ std::size_t encode_request(std::span<std::byte> out, Sequence sequence,
     return 0;
 }
 
+std::size_t encode_restart(std::span<std::byte> out, Sequence sequence, Timestamp now) noexcept {
+    return write_record(out, RecordType::Restart, kNoOwner, sequence, now, {});
+}
+
 std::size_t encode_record(std::span<std::byte> out, const JournalRecord& record) noexcept {
     const std::span<const std::byte> payload = record.payload_bytes();
     if (!payload_length_fits(record.type, payload.size()) ||
@@ -427,6 +435,7 @@ std::optional<pipeline::Request> request_of(const JournalRecord& record) noexcep
         case RecordType::SessionStart:
         case RecordType::AddSymbol:
         case RecordType::RiskLimits:
+        case RecordType::Restart:
             return std::nullopt;
     }
     return std::nullopt;
@@ -446,6 +455,8 @@ std::ostream& operator<<(std::ostream& os, RecordType type) {
             return os << "CancelAll";
         case RecordType::Stop:
             return os << "Stop";
+        case RecordType::Restart:
+            return os << "Restart";
     }
     return os << "RecordType(" << static_cast<int>(type) << ")";
 }

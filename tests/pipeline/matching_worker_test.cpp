@@ -334,6 +334,21 @@ TYPED_TEST(MatchingWorkerTest, ABlockingWorkerSleepsUntilItsDoorbellRings) {
     EXPECT_EQ(drain_all(replies).size(), 41U);  // 20 Accepted, 20 RequestDone, Stopped.
 }
 
+TEST(PublisherStubTest, RestoreOnlyCountsLevelUpdates) {
+    concurrency::SpscQueue<MarketEvent> events(16);
+    PublisherStub<concurrency::SpscQueue<MarketEvent>> publisher(events, WaitMode::Spin, nullptr);
+    MarketEvent level;
+    level.kind = MarketEventKind::LevelUpdate;
+    MarketEvent trade;
+    trade.kind = MarketEventKind::Trade;
+    publisher.restore(level);
+    publisher.restore(trade);
+    publisher.restore(level);
+    publisher.begin_new_session(7);
+    EXPECT_EQ(publisher.restored(), 2U);
+    EXPECT_EQ(publisher.stats().level_updates, 0U);
+}
+
 TEST(PublisherStubTest, CountsTradesAndLevelUpdatesUntilStop) {
     concurrency::SpscQueue<MarketEvent> events(16);
     PublisherStub<concurrency::SpscQueue<MarketEvent>> publisher(events, WaitMode::Spin, nullptr);

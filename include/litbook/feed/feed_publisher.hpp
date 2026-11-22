@@ -91,6 +91,19 @@ public:
     // std::invalid_argument for a bad tick size, lot size or level limit.
     Locate add_symbol(const FeedSymbol& symbol);
 
+    // Recovery calls, only before start(). Both throw std::logic_error after start.
+    //
+    // restore() applies a level update to the stock's copy without publishing anything,
+    // so after an exchange rebuilt its books from the journal, the first snapshots of the
+    // new session describe those books. Trades and Stop events are ignored, and so is an
+    // event for a stock that is not listed. A level that does not fit marks the copy as
+    // wrong, exactly as on_event does.
+    void restore(const pipeline::MarketEvent& event);
+    // Gives the feed a new session name. Receivers of the old session see a new session
+    // start and fill their books from the snapshot stream. Throws std::invalid_argument
+    // for a name that is not 1 to 10 letters and digits.
+    void rename_session(const std::string& session);
+
     // Sends Start of Messages and a Symbol Directory for every stock. The first snapshot
     // goes out at the first tick.
     void start(Timestamp now);
@@ -117,6 +130,7 @@ public:
     void end_session(Timestamp now);
 
     [[nodiscard]] std::size_t symbol_count() const noexcept { return symbols_.size(); }
+    [[nodiscard]] const std::string& session() const noexcept { return config_.session; }
     // The publisher's copy of a stock's levels. The caller makes sure locate is listed.
     [[nodiscard]] const LevelBook& copy(Locate locate) const noexcept {
         return symbols_[locate].copy;

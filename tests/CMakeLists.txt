@@ -41,9 +41,11 @@ add_executable(litbook_tests
     journal/journal_reader_test.cpp
     journal/journal_writer_test.cpp
     journal/replay_test.cpp
+    journal/setup_test.cpp
     metrics/latency_histogram_test.cpp
     pipeline/doorbell_test.cpp
     pipeline/feed_worker_test.cpp
+    pipeline/journal_worker_test.cpp
     pipeline/manual_pipeline_test.cpp
     pipeline/matching_worker_test.cpp
     pipeline/messages_test.cpp
@@ -51,6 +53,7 @@ add_executable(litbook_tests
     pipeline/reply_pump_test.cpp
     pipeline/threaded_feed_test.cpp
     pipeline/threaded_gateway_test.cpp
+    pipeline/threaded_journal_test.cpp
     protocol/byte_order_test.cpp
     protocol/codec_test.cpp
     protocol/order_entry_test.cpp

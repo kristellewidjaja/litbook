@@ -35,6 +35,7 @@ struct ReplayStats {
     std::uint64_t malformed_frames = 0;  // Frames the order entry layer could not decode.
     std::uint64_t cancel_alls = 0;
     std::uint64_t stops = 0;
+    std::uint64_t restarts = 0;
     Sequence last_sequence = 0;  // The sequence number of the last record applied.
 };
 
@@ -91,6 +92,11 @@ public:
                 break;
             case RecordType::Stop:
                 ++stats_.stops;
+                break;
+            case RecordType::Restart:
+                // Recovery writes this when the exchange starts again. Like Stop, it changes
+                // nothing in the order entry layer.
+                ++stats_.restarts;
                 break;
         }
         applied(record);

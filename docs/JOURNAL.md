@@ -61,6 +61,7 @@ The checksum is CRC32C, the CRC with the Castagnoli polynomial 0x1EDC6F41 used b
 | `F` | Frame | any | the OUCH message, 1 to 47 bytes | One inbound message from the account, exactly as the client sent it, still big-endian. |
 | `C` | Cancel All | any | none | Cancel every live order of the account (cancel on disconnect). |
 | `E` | Stop | 0 | none | The exchange shut down cleanly here. |
+| `A` | Restart | 0 | none | The exchange started again from this journal. Recovery writes it, and its sequence number names the new market data feed session. |
 
 Frame and Cancel All records may carry any owner, because replay must see exactly what the matching thread saw, and the order entry layer itself counts an owner that does not exist. Account names and passwords are never written to the journal. Only the order entry layer's state depends on the journal, and it knows accounts only by number.
 
@@ -139,14 +140,43 @@ The development machine is a Mac, and litbook runs in a Linux virtual machine un
 
 ## Replay
 
-`Replayer<Book>` applies records in order. Session Start builds the order entry layer, Add Symbol and Risk Limits make its startup calls, a Frame goes to `on_frame` and a Cancel All to `cancel_all` with the record's timestamp, exactly as `MatchingWorker` calls them. A Stop is only counted, because an exchange that stopped cleanly may have been started again and kept writing. Replay refuses a journal whose first record is not Session Start, that has a second Session Start, that lists a stock or a risk limit after the first request, or whose stocks get different SymbolIds than they did when they were listed.
+`Replayer<Book>` applies records in order. Session Start builds the order entry layer, Add Symbol and Risk Limits make its startup calls, a Frame goes to `on_frame` and a Cancel All to `cancel_all` with the record's timestamp, exactly as `MatchingWorker` calls them. A Stop and a Restart are only counted, because an exchange that stopped cleanly or crashed may have been started again and kept writing. Replay refuses a journal whose first record is not Session Start, that has a second Session Start, that lists a stock or a risk limit after the first request, or whose stocks get different SymbolIds than they did when they were listed.
 
 "The same state" is checked by the tests in four ways. The replies to every account are the same bytes in the same order (timestamps included). The trades and level updates are the same, at the same times. Every book has the same levels, quantities and order counts, and the order entry layer has the same live orders, UserRefNums, open order counts and statistics. And both handle any further requests the same way. The memory layout inside a book may differ (FastOrderBook's pool can hand out different slots), and nothing outside the book can tell. Every account's next sequence number is 1 plus its replies, so recovery can rebuild it from a replay.
+
+## In the pipeline
+
+With a journal, the threaded exchange has a fourth thread between the gateway thread and the matching thread (D-061).
+
+```
+gateway thread -> requests -> journal thread -> journaled requests -> matching thread
+```
+
+The journal thread takes every request that is waiting, at most 64 at a time, appends them all and writes them with one `commit()`. Only then does it pass them on to the matching thread. So no reply and no market data can leave the exchange before the request that caused it is in the journal. A Stop is flushed before it is passed on, so a clean shutdown always ends the journal with a Stop record.
+
+If a write or a sync fails, the batch is not passed on, the exchange ends the session for every client, and stopping it reports the error. The requests of a failed batch may still be in the file in full, and then recovery replays them, although their clients never got an answer. Once a request is in the journal, it has happened.
+
+## Recovery
+
+`litbook_gateway --journal PATH` starts from the journal when the file exists. Before any thread runs, it
+
+1. scans the file and refuses to start if the header is bad or the journal is corrupt (a good record after bad bytes);
+2. compares the setup records at the start of the journal with the ones the command line gives, and refuses to start if they differ, naming the first difference;
+3. replays every record into the matching thread's order entry layer, counting the replies of each account and giving the level updates to the market data feed's copy of the books, without sending anything;
+4. cuts off a torn last record;
+5. writes a Restart record and a Cancel All for every account with cancel on disconnect, flushes them, and then applies the cancels;
+6. sets every account's next sequence number to 1 plus its replies, and names the feed's new session after the Restart record's sequence number.
+
+Then it starts the threads and keeps appending to the same file. A file that holds only the 32-byte header is treated as a new journal. A journal that ends inside its setup records (a crash during the very first start) gets the missing ones. A file shorter than a header is refused, and an operator removes it.
+
+Messages that were produced for an account but never reached it are not sent again. The account's next sequence number skips past them, and a login that asks for an older number is refused, as before.
+
+The crash test (`GatewayJournalCrashTest`) kills `litbook_gateway` with SIGKILL 20 times at random points and starts it again on the same journal each time. After every kill it replays the journal and checks that every message any client ever saw is there, with the same sequence number and the same bytes. Linux can cut a large `write()` short when the process is killed (the copy into the page cache stops between pages), so a torn last record is possible and is accepted. A corrupt journal never is.
 
 ## Tool
 
 ```
-litbook_journal verify FILE            # how the file ends, record counts, sequence range
+litbook_journal verify FILE            # how the file ends, record counts (restarts too), sequence range
 litbook_journal dump FILE [--limit N]  # one line per record
 litbook_journal replay FILE            # rebuilds the state on SortedOrderBook and prints digests
 ```

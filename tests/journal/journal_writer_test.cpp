@@ -142,6 +142,22 @@ TEST_F(JournalWriterTest, CreateWritesOnlyTheHeader) {
     EXPECT_EQ(writer.stats().bytes_written, kFileHeaderLength);
 }
 
+TEST_F(JournalWriterTest, ARestartRecordTakesTheNextNumberAndHasNoOwner) {
+    {
+        JournalWriter writer = JournalWriter::create(path_, config_with(SyncPolicy::Write));
+        ASSERT_EQ(writer.append(request_number(1)), JournalStatus::Ok);
+        ASSERT_EQ(writer.append_restart(55), JournalStatus::Ok);
+        EXPECT_EQ(writer.next_sequence(), 3U);
+        ASSERT_EQ(writer.flush(), JournalStatus::Ok);
+    }
+    const std::vector<JournalRecord> list = records_of(path_);
+    ASSERT_EQ(list.size(), 2U);
+    EXPECT_EQ(list[1].type, RecordType::Restart);
+    EXPECT_EQ(list[1].sequence, 2U);
+    EXPECT_EQ(list[1].owner, kNoOwner);
+    EXPECT_EQ(list[1].now, 55U);
+}
+
 TEST_F(JournalWriterTest, CreateNeverReplacesAnExistingFile) {
     {
         std::ofstream(path_) << "an old journal";

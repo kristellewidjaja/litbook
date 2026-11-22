@@ -159,6 +159,21 @@ protected:
 
 TYPED_TEST_SUITE(OrderEntryTest, BookTypes, BookTypeNames);
 
+TYPED_TEST(OrderEntryTest, ANewOutboundSinkGetsEveryLaterReply) {
+    RecordingSink other;
+    const EnterOrder first = enter(1, Side::Buy, 300, 500'000);
+    const EnterOrder second = enter(2, Side::Buy, 100, 490'000);
+    this->in(1, first, 77);
+    this->entry_.set_outbound_sink(other);
+    this->in(1, second, 78);
+    EXPECT_EQ(this->sink_.take(), (std::vector<Sent>{accepted(1, first, 1, 77)}));
+    EXPECT_EQ(other.take(), (std::vector<Sent>{accepted(1, second, 2, 78)}));
+    this->entry_.set_outbound_sink(this->sink_);
+    this->in(1, enter(3, Side::Buy, 100, 480'000), 79);
+    EXPECT_EQ(this->sink_.take().size(), 1U);
+    EXPECT_TRUE(other.take().empty());
+}
+
 TYPED_TEST(OrderEntryTest, EnterOrderIsAccepted) {
     const EnterOrder e = enter(1, Side::Buy, 300, 500'000);
     this->in(1, e, 77);

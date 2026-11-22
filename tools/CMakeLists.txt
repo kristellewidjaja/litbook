@@ -30,7 +30,8 @@ if(LITBOOK_BUILD_TESTS)
         ${PROJECT_SOURCE_DIR}/tests/tools/itch_replay_smoke_test.cpp
         ${PROJECT_SOURCE_DIR}/tests/tools/gateway_smoke_test.cpp
         ${PROJECT_SOURCE_DIR}/tests/tools/feed_listener_smoke_test.cpp
-        ${PROJECT_SOURCE_DIR}/tests/tools/journal_tool_smoke_test.cpp)
+        ${PROJECT_SOURCE_DIR}/tests/tools/journal_tool_smoke_test.cpp
+        ${PROJECT_SOURCE_DIR}/tests/tools/gateway_journal_test.cpp)
     target_include_directories(litbook_tool_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests)
     target_link_libraries(litbook_tool_tests PRIVATE
         litbook::litbook litbook::warnings GTest::gtest_main)

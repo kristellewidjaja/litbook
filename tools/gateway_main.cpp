@@ -4,7 +4,7 @@
 //   litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... [--symbol TICKER]...
 //                   [--max-order-qty N] [--max-open-orders N]
 //                   [--feed INTERFACE] [--feed-incremental ADDRESS:PORT]
-//                   [--feed-snapshot ADDRESS:PORT]
+//                   [--feed-snapshot ADDRESS:PORT] [--journal PATH] [--sync write|sync]
 //
 // --port 0 lets the kernel pick a free port. The first line printed is always
 // "litbook_gateway listening on 127.0.0.1:PORT", so scripts and tests can find the port.
@@ -18,9 +18,19 @@
 // to 239.255.0.1:15100 (incremental) and 239.255.0.2:15101 (snapshots). The second line
 // printed then says where the feed goes. litbook_feed_listener reads it.
 //
+// With --journal the exchange also runs on the pipeline, with a fourth thread that writes
+// every request to the journal file before the matching thread handles it
+// (docs/JOURNAL.md). If the file exists, the exchange first rebuilds itself from it, so a
+// restart after a crash carries on where the journal ends, and every account's sequence
+// numbers carry on too. The accounts, stocks and limits on the command line must be the
+// same as when the journal was started. A line after the listening line (and the feed
+// line) says what was found. --sync sync calls fdatasync after every batch of requests,
+// and the default, write, survives a crash of the process but not of the machine.
+//
 // SIGINT (Ctrl-C) or SIGTERM stops the server. It then ends the session, so clients get
 // End of Session (and feed listeners too), prints its counters and exits with 0. Bad
-// arguments exit with 2.
+// arguments exit with 2. A journal that cannot be used, or that fails while the exchange
+// runs, stops the server with a message and exit code 1.
 
 #include "litbook/book/sorted_order_book.hpp"
 #include "litbook/concurrency/spsc_queue.hpp"
@@ -29,11 +39,18 @@
 #include "litbook/feed/udp_feed_sink.hpp"
 #include "litbook/gateway/epoll_gateway.hpp"
 #include "litbook/gateway/session_manager.hpp"
+#include "litbook/journal/journal_writer.hpp"
 #include "litbook/pipeline/feed_worker.hpp"
+#include "litbook/pipeline/publisher.hpp"
 #include "litbook/pipeline/threaded_gateway.hpp"
 
+#include <poll.h>
 #include <pthread.h>
+#include <sys/signalfd.h>
+#include <unistd.h>
 
+#include <array>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -51,6 +68,8 @@ using Gateway = litbook::gateway::EpollGateway<litbook::SortedOrderBook>;
 using Manager = litbook::gateway::SessionManager<litbook::SortedOrderBook>;
 using FeedExchange = litbook::pipeline::BasicThreadedGateway<
     litbook::SortedOrderBook, litbook::concurrency::SpscQueue, litbook::pipeline::FeedWorker>;
+using StubExchange =
+    litbook::pipeline::ThreadedGateway<litbook::SortedOrderBook, litbook::concurrency::SpscQueue>;
 
 // The signal handler needs to reach the gateway, and a handler can only see globals.
 Gateway* g_gateway = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -76,6 +95,9 @@ struct Options {
     std::optional<litbook::feed::FeedNetworkConfig> feed;
     std::optional<litbook::feed::MulticastGroup> feed_incremental;
     std::optional<litbook::feed::MulticastGroup> feed_snapshot;
+    // Set by --journal and --sync.
+    std::optional<std::string> journal;
+    std::optional<litbook::journal::SyncPolicy> sync;
 };
 
 // Parses "ADDRESS:PORT" for a feed group, or returns false.
@@ -161,12 +183,22 @@ bool parse_options(int argc, char** argv, Options& o) {
             if (!parse_feed_group(value, o.feed_snapshot)) {
                 return false;
             }
+        } else if (flag == "--journal" && !value.empty()) {
+            o.journal = std::string(value);
+        } else if (flag == "--sync" && value == "write") {
+            o.sync = litbook::journal::SyncPolicy::Write;
+        } else if (flag == "--sync" && value == "sync") {
+            o.sync = litbook::journal::SyncPolicy::Sync;
         } else {
             return false;
         }
     }
     // The group flags only make sense with a feed.
     if (!o.feed && (o.feed_incremental || o.feed_snapshot)) {
+        return false;
+    }
+    // And --sync only with a journal.
+    if (!o.journal && o.sync) {
         return false;
     }
     if (o.feed && o.feed_incremental) {
@@ -236,28 +268,25 @@ int run_single_threaded(const Options& o, const std::vector<litbook::Ticker>& ti
     return 0;
 }
 
-// The three-thread pipeline with the market data feed, sent where `network` says.
-int run_with_feed(const Options& o, const litbook::feed::FeedNetworkConfig& network,
-                  const std::vector<litbook::Ticker>& tickers) {
-    litbook::feed::UdpFeedSink sink(network);
-    litbook::pipeline::FeedWorkerOptions feed;
-    feed.feed.max_symbols = tickers.size();
-    feed.sink = &sink;
-
-    FeedExchange exchange(
-        litbook::gateway::SessionConfig{}, order_entry_config(o),
-        litbook::gateway::GatewayConfig{.port = o.port},
-        litbook::pipeline::PipelineConfig{.wait = litbook::pipeline::WaitMode::Block}, feed);
-    for (const Account& a : o.accounts) {
-        exchange.add_account(account_config(o, a));
+// Prints what start() found in the journal.
+void print_recovery(const std::string& path, const litbook::pipeline::RecoveryReport& r) {
+    if (!r.recovered) {
+        std::printf("litbook_gateway journal %s: new\n", path.c_str());
+        return;
     }
-    for (const litbook::Ticker ticker : tickers) {
-        exchange.add_symbol(ticker, kBookConfig);
-    }
+    std::printf(
+        "litbook_gateway journal %s: recovered %llu records (torn bytes cut %zu), replayed "
+        "%llu frames and %llu cancel alls, replies %llu, restart %llu, cancels on restart %u\n",
+        path.c_str(), static_cast<unsigned long long>(r.records), r.torn_bytes,
+        static_cast<unsigned long long>(r.frames), static_cast<unsigned long long>(r.cancel_alls),
+        static_cast<unsigned long long>(r.replies),
+        static_cast<unsigned long long>(r.restart_sequence), r.cancels_on_restart);
+}
 
-    // stop() joins threads, which is not allowed inside a signal handler. So the signals
-    // are blocked here, before the threads start (they inherit the mask), and this thread
-    // waits for one with sigwait and then stops the pipeline normally.
+// Blocks SIGINT and SIGTERM in this thread, before any other thread starts (they inherit
+// the mask), and returns a signalfd that becomes readable when one of them arrives. A
+// signal handler cannot stop the pipeline, because stop() joins threads.
+litbook::gateway::Fd block_stop_signals() {
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
@@ -265,32 +294,103 @@ int run_with_feed(const Options& o, const litbook::feed::FeedNetworkConfig& netw
     if (pthread_sigmask(SIG_BLOCK, &signals, nullptr) != 0) {
         throw std::runtime_error("pthread_sigmask failed");
     }
+    litbook::gateway::Fd fd(signalfd(-1, &signals, SFD_CLOEXEC));
+    if (!fd.valid()) {
+        throw std::runtime_error("signalfd failed");
+    }
+    return fd;
+}
 
+// Waits until a stop signal arrives or the exchange shuts itself down (its journal
+// failed). Returns true for a signal.
+bool wait_for_stop(int signal_fd, int finished_fd) {
+    std::array<pollfd, 2> fds{pollfd{.fd = signal_fd, .events = POLLIN, .revents = 0},
+                              pollfd{.fd = finished_fd, .events = POLLIN, .revents = 0}};
+    for (;;) {
+        const int n = poll(fds.data(), fds.size(), -1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            throw std::runtime_error("poll failed");
+        }
+        return (fds[0].revents & POLLIN) != 0;
+    }
+}
+
+// The pipeline, with the market data feed if `feed` is set and a journal if the options
+// name one. It runs in blocking mode.
+template <class Exchange>
+int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
+                 const typename Exchange::PublisherOptions& publisher_options,
+                 const litbook::feed::FeedNetworkConfig* feed,
+                 const litbook::feed::UdpFeedSink* sink) {
+    std::optional<litbook::pipeline::JournalOptions> journal;
+    if (o.journal) {
+        journal.emplace();
+        journal->path = *o.journal;
+        journal->writer.sync = o.sync.value_or(litbook::journal::SyncPolicy::Write);
+    }
+    Exchange exchange(litbook::gateway::SessionConfig{}, order_entry_config(o),
+                      litbook::gateway::GatewayConfig{.port = o.port},
+                      litbook::pipeline::PipelineConfig{.wait = litbook::pipeline::WaitMode::Block},
+                      publisher_options, journal ? &*journal : nullptr);
+    for (const Account& a : o.accounts) {
+        exchange.add_account(account_config(o, a));
+    }
+    for (const litbook::Ticker ticker : tickers) {
+        exchange.add_symbol(ticker, kBookConfig);
+    }
+
+    const litbook::gateway::Fd signals = block_stop_signals();
     exchange.start();
     std::printf("litbook_gateway listening on 127.0.0.1:%u\n",
                 static_cast<unsigned>(exchange.port()));
-    std::printf("litbook_gateway feed on %s: incremental %s:%u, snapshot %s:%u\n",
-                network.interface_name.c_str(), network.incremental.address.c_str(),
-                static_cast<unsigned>(network.incremental.port), network.snapshot.address.c_str(),
-                static_cast<unsigned>(network.snapshot.port));
+    if (feed != nullptr) {
+        std::printf("litbook_gateway feed on %s: incremental %s:%u, snapshot %s:%u\n",
+                    feed->interface_name.c_str(), feed->incremental.address.c_str(),
+                    static_cast<unsigned>(feed->incremental.port), feed->snapshot.address.c_str(),
+                    static_cast<unsigned>(feed->snapshot.port));
+    }
+    if (journal) {
+        print_recovery(journal->path, exchange.recovery());
+    }
     std::fflush(stdout);
 
-    int received = 0;
-    sigwait(&signals, &received);
+    (void)wait_for_stop(signals.get(), exchange.finished_fd());
+    // This rethrows a failed journal, which main reports with exit code 1.
     exchange.stop();
 
     print_session_stats(exchange.sessions().stats(),
                         exchange.matching().order_entry().live_orders());
-    const auto& incremental = sink.sender(litbook::feed::FeedStream::Incremental).stats();
-    const auto& snapshot = sink.sender(litbook::feed::FeedStream::Snapshot).stats();
-    const std::uint64_t dropped = incremental.dropped + snapshot.dropped;
-    const std::uint64_t failed = incremental.failed + snapshot.failed;
-    std::printf(
-        "feed: incremental packets %llu, snapshot packets %llu, dropped %llu, failed %llu\n",
-        static_cast<unsigned long long>(incremental.sent),
-        static_cast<unsigned long long>(snapshot.sent), static_cast<unsigned long long>(dropped),
-        static_cast<unsigned long long>(failed));
+    if (sink != nullptr) {
+        const auto& incremental = sink->sender(litbook::feed::FeedStream::Incremental).stats();
+        const auto& snapshot = sink->sender(litbook::feed::FeedStream::Snapshot).stats();
+        const std::uint64_t dropped = incremental.dropped + snapshot.dropped;
+        const std::uint64_t failed = incremental.failed + snapshot.failed;
+        std::printf(
+            "feed: incremental packets %llu, snapshot packets %llu, dropped %llu, failed %llu\n",
+            static_cast<unsigned long long>(incremental.sent),
+            static_cast<unsigned long long>(snapshot.sent),
+            static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(failed));
+    }
+    if (const auto* worker = exchange.journal()) {
+        std::printf("journal: records %llu, commits %llu, syncs %llu, next sequence %llu\n",
+                    static_cast<unsigned long long>(worker->writer().stats().records),
+                    static_cast<unsigned long long>(worker->writer().stats().commits),
+                    static_cast<unsigned long long>(worker->writer().stats().syncs),
+                    static_cast<unsigned long long>(worker->writer().next_sequence()));
+    }
     return 0;
+}
+
+int run_with_feed(const Options& o, const litbook::feed::FeedNetworkConfig& network,
+                  const std::vector<litbook::Ticker>& tickers) {
+    litbook::feed::UdpFeedSink sink(network);
+    litbook::pipeline::FeedWorkerOptions feed;
+    feed.feed.max_symbols = tickers.size();
+    feed.sink = &sink;
+    return run_threaded<FeedExchange>(o, tickers, feed, &network, &sink);
 }
 
 }  // namespace
@@ -302,7 +402,7 @@ int main(int argc, char** argv) try {
                      "usage: litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... "
                      "[--symbol TICKER]... [--max-order-qty N] [--max-open-orders N] "
                      "[--feed INTERFACE] [--feed-incremental ADDRESS:PORT] "
-                     "[--feed-snapshot ADDRESS:PORT]\n");
+                     "[--feed-snapshot ADDRESS:PORT] [--journal PATH] [--sync write|sync]\n");
         return 2;
     }
     std::vector<litbook::Ticker> tickers;
@@ -316,6 +416,9 @@ int main(int argc, char** argv) try {
     }
     if (o.feed.has_value()) {
         return run_with_feed(o, *o.feed, tickers);
+    }
+    if (o.journal.has_value()) {
+        return run_threaded<StubExchange>(o, tickers, {}, nullptr, nullptr);
     }
     return run_single_threaded(o, tickers);
 } catch (const std::exception& e) {

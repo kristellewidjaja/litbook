@@ -195,6 +195,49 @@ TEST_F(SessionManagerTest, AnAccountCanHaveOnlyOneConnection) {
     logged_in("alice", "secret");
 }
 
+TEST_F(SessionManagerTest, ARestoredSequenceIsWhatTheNextLoginAndReplyUse) {
+    m_->restore_next_sequence(kBob, 41);
+    EXPECT_EQ(m_->next_sequence(kBob), 41U);
+    const ConnectionId id = m_->open(0);
+    m_->receive(id, login("bob", "hunter2"), 0);
+    const auto packets = take(id);
+    ASSERT_EQ(packets.size(), 1U);
+    EXPECT_EQ(accepted_body(packets[0]).sequence, 41U);
+    m_->receive(id, unsequenced(buy(1, 10, 500'000)), 1);
+    EXPECT_EQ(messages(take(id)).size(), 1U);
+    EXPECT_EQ(m_->next_sequence(kBob), 42U);
+    EXPECT_EQ(m_->next_sequence(kAlice), 1U);  // Other accounts are left alone.
+}
+
+TEST_F(SessionManagerTest, AfterARestoreALoginAskingForAnOlderMessageIsRefused) {
+    m_->restore_next_sequence(kBob, 10);
+    const ConnectionId id = m_->open(0);
+    m_->receive(id, login("bob", "hunter2", "", 9), 0);
+    const auto packets = take(id);
+    ASSERT_EQ(packets.size(), 1U);
+    EXPECT_EQ(rejected_reason(packets[0]), soup::LoginRejectReason::SessionNotAvailable);
+    const ConnectionId again = m_->open(0);
+    m_->receive(again, login("bob", "hunter2", "", 10), 0);
+    EXPECT_EQ(accepted_body(take(again).at(0)).sequence, 10U);
+}
+
+TEST_F(SessionManagerTest, RestoringASequenceChecksItsArguments) {
+    EXPECT_THROW(m_->restore_next_sequence(kBob, 0), std::invalid_argument);
+    EXPECT_THROW(m_->restore_next_sequence(kNoOwner, 5), std::out_of_range);
+    EXPECT_THROW(m_->restore_next_sequence(99, 5), std::out_of_range);
+    (void)logged_in("bob", "hunter2");
+    EXPECT_THROW(m_->restore_next_sequence(kBob, 5), std::logic_error);
+    EXPECT_EQ(m_->next_sequence(kBob), 1U);
+}
+
+TEST_F(SessionManagerTest, AccountsAndTheirCancelOnDisconnectCanBeListed) {
+    EXPECT_EQ(m_->account_count(), 2U);
+    EXPECT_THROW((void)m_->cancels_on_disconnect(kNoOwner), std::out_of_range);
+    EXPECT_THROW((void)m_->cancels_on_disconnect(3), std::out_of_range);
+    EXPECT_TRUE(m_->cancels_on_disconnect(kAlice));
+    EXPECT_FALSE(m_->cancels_on_disconnect(kBob));
+}
+
 TEST_F(SessionManagerTest, SequenceNumbersContinueAcrossConnections) {
     ConnectionId id = logged_in("bob", "hunter2");
     m_->receive(id, unsequenced(buy(1, 10, 500'000)), 1);

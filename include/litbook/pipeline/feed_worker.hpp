@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace litbook::pipeline {
 
@@ -97,6 +98,22 @@ public:
                                                .tick_size = config.tick_size,
                                                .lot_size = config.lot_size,
                                                .max_levels_per_side = max_levels_per_side_});
+    }
+
+    // Recovery calls, before start. restore() gives the feed's level copy one level update
+    // that recovery produced while it rebuilt the books from the journal, so nothing is
+    // published for it. begin_new_session() names the feed's session after the journal's
+    // Restart record, so every start gets a session name of its own and receivers fill
+    // their books again from the snapshot stream. Both throw std::logic_error after start.
+    void restore(const MarketEvent& event) { publisher_.restore(event); }
+    void begin_new_session(std::uint64_t restart_sequence) {
+        publisher_.rename_session(session_name_for(restart_sequence));
+    }
+
+    // A session name is at most 10 digits, so the sequence number is cut to its last 10.
+    [[nodiscard]] static std::string session_name_for(std::uint64_t restart_sequence) {
+        constexpr std::uint64_t kTenDigits = 10'000'000'000ULL;
+        return std::to_string(restart_sequence % kTenDigits);
     }
 
     // Sends Start of Messages and the directory. run() calls it first.

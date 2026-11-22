@@ -426,6 +426,19 @@ TEST(ReplayStatusTest, AStopInTheMiddleIsOnlyCounted) {
     EXPECT_EQ(replayer.stats().last_sequence, 4U);
 }
 
+TEST(ReplayStatusTest, ARestartIsOnlyCounted) {
+    const auto restart = testing::encoded([&](auto o) { return encode_restart(o, 3, 0); });
+    RecordingReplies replies;
+    Replayer<SortedOrderBook> replayer(replies);
+    for (const JournalRecord& r :
+         records({start_record(1), symbol_record(2, 0, "AAPL"), restart, cancel_all_record(4)})) {
+        ASSERT_EQ(replayer.apply(r), ReplayStatus::Ok);
+    }
+    EXPECT_EQ(replayer.stats().restarts, 1U);
+    EXPECT_EQ(replayer.stats().stops, 0U);
+    EXPECT_EQ(replayer.stats().cancel_alls, 1U);
+}
+
 TEST(ReplayStatusTest, ACorruptOrUnreadableJournalIsNotReplayedAtAll) {
     std::vector<std::byte> file(kFileHeaderLength);
     encode_file_header(file, 1);

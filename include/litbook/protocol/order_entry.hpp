@@ -119,6 +119,11 @@ public:
     // This is a startup call, and the sink must outlive the order entry layer.
     void set_market_data_sink(MarketDataSink* sink) noexcept { market_data_ = sink; }
 
+    // Sends every later reply to `sink` instead. Recovery uses it to count the replies that
+    // replaying a journal produces, and then points the replies back at the matching
+    // thread. This is a startup call, and the sink must outlive its use.
+    void set_outbound_sink(OutboundSink& sink) noexcept { sink_ = &sink; }
+
     // Decodes one inbound frame from `owner` and handles it. A malformed frame is counted
     // and its DecodeStatus is returned, and nothing else happens. `now` is the timestamp
     // put on every outbound message this frame causes.

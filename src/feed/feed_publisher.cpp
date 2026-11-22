@@ -64,6 +64,31 @@ Locate FeedPublisher::add_symbol(const FeedSymbol& symbol) {
     return locate;
 }
 
+void FeedPublisher::restore(const pipeline::MarketEvent& event) {
+    if (started_) {
+        throw std::logic_error("feed levels can only be restored before start()");
+    }
+    if (event.kind != pipeline::MarketEventKind::LevelUpdate || event.symbol >= symbols_.size()) {
+        return;
+    }
+    Symbol& symbol = symbols_[event.symbol];
+    if (!symbol.copy.set(event.side, event.price, event.qty, event.order_count)) {
+        symbol.copy_ok = false;
+        ++stats_.copy_full;
+    }
+}
+
+void FeedPublisher::rename_session(const std::string& session) {
+    if (started_) {
+        throw std::logic_error("the feed session can only be renamed before start()");
+    }
+    const SessionName name = checked_session(session);
+    for (Stream& s : streams_) {
+        s.builder = PacketBuilder(name, config_.max_packet_length);
+    }
+    config_.session = session;
+}
+
 void FeedPublisher::start(Timestamp now) {
     if (started_) {
         return;

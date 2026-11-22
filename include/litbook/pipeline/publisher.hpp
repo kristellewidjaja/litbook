@@ -53,6 +53,16 @@ public:
     // The stub publishes nothing per stock, so there is nothing to list.
     void add_symbol(SymbolId /*id*/, Ticker /*ticker*/, const BookConfig& /*config*/) noexcept {}
 
+    // The recovery calls (see FeedWorker). The stub keeps no levels and has no session, so
+    // it only counts the level updates it was given.
+    void restore(const MarketEvent& event) noexcept {
+        if (event.kind == MarketEventKind::LevelUpdate) {
+            ++restored_;
+        }
+    }
+    void begin_new_session(std::uint64_t /*restart_sequence*/) noexcept {}
+    [[nodiscard]] std::uint64_t restored() const noexcept { return restored_; }
+
     // Pops and handles one event. Returns false if the queue was empty or the publisher
     // has already stopped.
     bool step() {
@@ -116,6 +126,7 @@ private:
     WaitMode mode_;
     Doorbell* bell_;
     PublisherStats stats_;
+    std::uint64_t restored_ = 0;
     bool stopped_ = false;
 };
 

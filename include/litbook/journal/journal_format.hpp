@@ -54,6 +54,7 @@ enum class RecordType : std::uint8_t {
     Frame = 'F',         // One inbound OUCH message from an account.
     CancelAll = 'C',     // Cancel every live order of an account (cancel on disconnect).
     Stop = 'E',          // The exchange shut down cleanly here.
+    Restart = 'A',       // The exchange started again from this journal (recovery).
 };
 
 std::ostream& operator<<(std::ostream& os, RecordType type);
@@ -132,6 +133,8 @@ std::size_t encode_risk_limits(std::span<std::byte> out, Sequence sequence, Time
                                OwnerId owner, const protocol::RiskLimits& limits) noexcept;
 std::size_t encode_request(std::span<std::byte> out, Sequence sequence,
                            const pipeline::Request& request) noexcept;
+// The record recovery appends each time the exchange starts again from a journal.
+std::size_t encode_restart(std::span<std::byte> out, Sequence sequence, Timestamp now) noexcept;
 
 // Encodes a record that is already decoded, which gives back its exact bytes.
 std::size_t encode_record(std::span<std::byte> out, const JournalRecord& record) noexcept;

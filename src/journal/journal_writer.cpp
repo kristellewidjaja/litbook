@@ -186,6 +186,12 @@ JournalStatus JournalWriter::append(const pipeline::Request& request) {
         [&](std::span<std::byte> out) { return encode_request(out, sequence, request); });
 }
 
+JournalStatus JournalWriter::append_restart(Timestamp now) {
+    const Sequence sequence = next_sequence_;
+    return append_with(
+        [&](std::span<std::byte> out) { return encode_restart(out, sequence, now); });
+}
+
 JournalStatus JournalWriter::commit() {
     return write_pending(false);
 }

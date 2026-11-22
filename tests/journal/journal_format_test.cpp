@@ -92,6 +92,29 @@ TEST(JournalFormatTest, CancelAllAndStopRecordBytes) {
     EXPECT_EQ(out, with_checksum(golden_header(28, 'E', 0)));
 }
 
+TEST(JournalFormatTest, RestartRecordBytes) {
+    const auto out = encoded([&](auto o) { return encode_restart(o, 7, kTime); });
+    EXPECT_EQ(out, with_checksum(golden_header(28, 'A', 0)));
+    const DecodedRecord d = decode_record(out);
+    ASSERT_EQ(d.status, RecordStatus::Ok);
+    EXPECT_EQ(d.record.type, RecordType::Restart);
+    EXPECT_FALSE(request_of(d.record).has_value());
+}
+
+TEST(JournalFormatTest, ARestartRecordBelongsToNoAccountAndHasNoPayload) {
+    auto with_owner = encoded([&](auto o) { return encode_restart(o, 7, kTime); });
+    with_owner[4] = std::byte{1};
+    testing::reseal(with_owner);
+    EXPECT_EQ(decode_record(with_owner).status, RecordStatus::BadOwner);
+
+    // The Cancel All record with a payload byte is too long for a Restart as well.
+    auto with_payload = encoded([&](auto o) { return encode_restart(o, 7, kTime); });
+    with_payload.insert(with_payload.begin() + kRecordHeaderLength, std::byte{0});
+    with_payload[0] = std::byte{29};
+    testing::reseal(with_payload);
+    EXPECT_EQ(decode_record(with_payload).status, RecordStatus::BadLength);
+}
+
 TEST(JournalFormatTest, SessionStartRecordBytes) {
     protocol::OrderEntryConfig config;
     config.max_owners = 4;

@@ -77,6 +77,17 @@ protected:
     Worker worker_;
 };
 
+TEST_F(FeedWorkerTest, ANewSessionIsNamedAfterTheRestartRecord) {
+    EXPECT_EQ(Worker::session_name_for(17), "17");
+    EXPECT_EQ(Worker::session_name_for(12'345'678'901ULL), "2345678901");
+    worker_.restore(feed::testing::level_event(1, Side::Sell, 10'100, 7, 1));
+    worker_.begin_new_session(17);
+    EXPECT_EQ(worker_.feed().session(), "17");
+    EXPECT_EQ(worker_.feed().copy(1).level_count(Side::Sell), 1U);
+    worker_.start();
+    EXPECT_THROW(worker_.begin_new_session(18), std::logic_error);
+}
+
 TEST_F(FeedWorkerTest, StartSendsTheDirectory) {
     worker_.start();
     ASSERT_EQ(sink_.packets.size(), 1U);

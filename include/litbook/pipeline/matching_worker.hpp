@@ -112,6 +112,18 @@ public:
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
     [[nodiscard]] const MatchingStats& stats() const noexcept { return stats_; }
 
+    // Recovery replays the journal into this worker's order entry layer before the thread
+    // starts. While it does, the replies and market events go to these sinks instead of
+    // the queues, because nobody drains the queues yet. Call end_redirect() before start.
+    void redirect_output(protocol::OutboundSink& replies, protocol::MarketDataSink& events) {
+        order_entry_.set_outbound_sink(replies);
+        order_entry_.set_market_data_sink(&events);
+    }
+    void end_redirect() {
+        order_entry_.set_outbound_sink(*this);
+        order_entry_.set_market_data_sink(this);
+    }
+
     // The order entry layer. Only touch it before the thread starts (startup calls) or
     // after it has stopped.
     [[nodiscard]] protocol::OrderEntry<Book>& order_entry() noexcept { return order_entry_; }

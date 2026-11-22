@@ -121,6 +121,8 @@ public:
                                      const protocol::RiskLimits& limits);
     // A Frame, CancelAll or Stop request, exactly as the matching thread will see it.
     JournalStatus append(const pipeline::Request& request);
+    // The record recovery writes when the exchange starts again from this journal.
+    JournalStatus append_restart(Timestamp now);
 
     // Writes the records appended since the last commit, following the sync policy.
     JournalStatus commit();
@@ -131,6 +133,7 @@ public:
     [[nodiscard]] std::size_t pending_bytes() const noexcept { return pending_; }
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
     [[nodiscard]] SyncPolicy policy() const noexcept { return config_.sync; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buffer_.size(); }
     [[nodiscard]] const JournalWriterStats& stats() const noexcept { return stats_; }
 
 private:

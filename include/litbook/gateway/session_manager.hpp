@@ -206,6 +206,23 @@ public:
         return backend_.add_symbol(ticker, config);
     }
 
+    // Sets the number the account's next sequenced message gets. Recovery calls it after
+    // replaying the journal, with 1 plus the replies the account had before the restart,
+    // so the numbers carry on where the clients left off. This is a startup call. Throws
+    // std::invalid_argument for 0, std::out_of_range for an owner that is not an account,
+    // and std::logic_error while the account has a connection.
+    void restore_next_sequence(OwnerId owner, std::uint64_t next) {
+        Account& a = account_at(owner);
+        if (next == 0) {
+            throw std::invalid_argument("sequence numbers start at 1");
+        }
+        if (a.connection != kNoConnection) {
+            throw std::logic_error(
+                "an account's sequence can only be restored while it is logged out");
+        }
+        a.next_sequence = next;
+    }
+
     // Connection events, called by the network code.
 
     // A new connection arrived. Returns its id, or kNoConnection if every slot is in use,
@@ -476,6 +493,11 @@ public:
     [[nodiscard]] ConnectionId connection_of(OwnerId owner) const {
         return account_at(owner).connection;
     }
+    // How many accounts were added. Their OwnerIds are 1 to this number.
+    [[nodiscard]] std::size_t account_count() const noexcept { return account_count_; }
+    [[nodiscard]] bool cancels_on_disconnect(OwnerId owner) const {
+        return account_at(owner).cancel_on_disconnect;
+    }
 
 private:
     // Everything kept per account. Unlike a Session, this outlives any one connection.
@@ -572,6 +594,12 @@ private:
     }
 
     const Account& account_at(OwnerId owner) const {
+        if (owner == kNoOwner || owner > account_count_) {
+            throw std::out_of_range("not an account");
+        }
+        return accounts_[owner];
+    }
+    Account& account_at(OwnerId owner) {
         if (owner == kNoOwner || owner > account_count_) {
             throw std::out_of_range("not an account");
         }
