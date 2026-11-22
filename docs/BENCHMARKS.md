@@ -9,6 +9,18 @@ Every number here must come from an actual run on a recorded machine. No estimat
 |----|-------------|
 | M1 | Apple M3 Pro (11 cores, 18 GiB), macOS 15.0.1 host, Docker Desktop 28.3.3 VM (11 vCPU, 7.7 GiB, kernel 6.10.14-linuxkit), Ubuntu 26.04.1 linux/arm64 container. VM, so expect noise. Google Benchmark reports the CPU as "48 MHz" here: it cannot read the real clock inside the VM, so ignore that field. |
 
+**Renamed commits.** On 2026-11-22 the "Phase N:" prefix was removed from five commit messages, which gave those commits and the ones after them new hashes. The files at each commit did not change (every pair has the same tree). Rows below keep the hash they were recorded with, and this table gives the current one.
+
+| Recorded as | Now |
+|---|---|
+| 130e452 | a3cfed9 |
+| 2f3e050 | a873f66 |
+| cd28274 | 5034c67 |
+| fb7128a | 25dabef |
+| 1ed3b1c | 0d2c338 |
+| e67937f | 962b593 |
+| 70c739f | 34710f7 |
+
 **Results**
 
 | Date | Commit | Machine | Compiler + flags | Benchmark | Workload | Result | Notes |
