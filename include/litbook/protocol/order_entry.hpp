@@ -25,6 +25,24 @@
 
 namespace litbook::protocol {
 
+// The key under which the order entry layer finds a live order by its account and the
+// UserRefNum the client gave it. Every pair of an account (1 to max_owners) and a
+// UserRefNum gets its own key, and the largest one is exactly 2^64 - 1.
+//
+// The account is the lowest digit, counted in base max_owners + 1, so the keys of all
+// accounts are interleaved into one increasing range, the same pattern as exchange order
+// references. FlatIdMap's fold hash gives every key of such a range its own home slot (in
+// each block of table-size keys it XORs every key with the same value), and keeps recent
+// orders in nearby slots. With the account in the high 32 bits instead, as before, every
+// account had a range of its own, and the fold laid the ranges only 2,048 slots apart, so
+// the accounts' recent orders competed for the same slots. At 100,000 live orders that
+// made one probe run of about 50,000 slots and every frame about 165 times slower (30.4 us
+// instead of 0.18 us, DECISIONS.md D-067).
+[[nodiscard]] constexpr FlatIdMap::Key client_map_key(OwnerId owner, UserRefNum user_ref,
+                                                      OwnerId max_owners) noexcept {
+    return (static_cast<std::uint64_t>(user_ref) * (std::uint64_t{max_owners} + 1)) + owner;
+}
+
 // Receives every outbound frame, already encoded, together with the account it is for.
 // In Phase 6 the gateway writes the frame to that account's connection. The frame is only
 // valid during the call.
@@ -339,8 +357,8 @@ private:
         return accounts_[owner];
     }
 
-    static FlatIdMap::Key client_key(OwnerId owner, UserRefNum user_ref) noexcept {
-        return (static_cast<std::uint64_t>(owner) << 32U) | user_ref;
+    [[nodiscard]] FlatIdMap::Key client_key(OwnerId owner, UserRefNum user_ref) const noexcept {
+        return client_map_key(owner, user_ref, config_.max_owners);
     }
 
     // Applies the UserRefNum rule. Returns false if the message must be ignored.

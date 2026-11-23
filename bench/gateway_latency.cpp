@@ -4,6 +4,7 @@
 //                           [--pipeline inline|spsc|mutex]
 //                           [--pin CLIENT GATEWAY MATCHING PUBLISHER]
 //                           [--window N] [--sample-every N]
+//                           [--journal DIR [--sync write|sync]]
 //
 // With --pipeline inline (the default) the gateway runs on one thread, as in Phase 6, and
 // the session layer calls the order entry layer directly. With spsc or mutex it is the
@@ -36,6 +37,14 @@
 // shows what the pipeline itself adds. It is one histogram over the whole run, the warm
 // up pass included.
 //
+// With a journal (--journal DIR, which must be new or empty, and a pipeline) the
+// pipeline gets its journal thread between the gateway and the matching thread, so every
+// request is written to DIR before it is matched (DECISIONS.md D-061). --sync write (the
+// default) calls write() once per batch, --sync sync adds fdatasync(). The journal stays
+// in one segment with no snapshots, so the run measures only what the journal thread
+// adds. Put DIR on the virtual machine's own disk (/tmp in the dev container), not on
+// /work, where fdatasync is suspiciously cheap.
+//
 // --pin puts the client (the main thread) and the gateway, matching and publisher threads
 // on the given CPUs. The inline gateway only uses CLIENT and GATEWAY. Inside the Docker
 // VM those are virtual CPUs (see thread_affinity.hpp).
@@ -67,6 +76,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -98,6 +108,8 @@ struct Options {
     int publisher_cpu = -1;
     std::size_t window = 0;  // 0 means the latency run.
     std::uint32_t sample_every = 16;
+    std::string journal;  // Empty for no journal.
+    std::string sync;     // Empty until --sync is given, then "write" or "sync".
 };
 
 // The configuration both kinds of server use.
@@ -126,6 +138,10 @@ struct ServerReport {
     std::uint64_t event_waits = 0;
     std::uint64_t pump_drains = 0;
     std::uint64_t level_updates = 0;
+    bool journal = false;
+    std::uint64_t journal_records = 0;
+    std::uint64_t journal_commits = 0;
+    std::uint64_t journal_syncs = 0;
 };
 
 // The single-threaded gateway of Phase 6, run on a thread of its own.
@@ -187,8 +203,10 @@ public:
     using Exchange = pipeline::ThreadedGateway<SortedOrderBook, Queue>;
 
     PipelineServer(const Options& options, Ticker symbol)
-        : exchange_(session_config(options), order_entry_config(), gateway::GatewayConfig{},
-                    pipeline_config(options)) {
+        : journal_(journal_options(options)),
+          exchange_(session_config(options), order_entry_config(), gateway::GatewayConfig{},
+                    pipeline_config(options), typename Exchange::PublisherOptions{},
+                    journal_ ? &*journal_ : nullptr) {
         exchange_.add_account(kAccount);
         exchange_.add_symbol(symbol, kBook);
     }
@@ -220,6 +238,13 @@ public:
         report.event_waits = exchange_.matching().stats().event_waits;
         report.pump_drains = exchange_.pump().stats().drains;
         report.level_updates = exchange_.publisher().stats().level_updates;
+        if (const auto* worker = exchange_.journal()) {
+            const journal::JournalWriterStats& w = worker->writer().stats();
+            report.journal = true;
+            report.journal_records = w.records;
+            report.journal_commits = w.commits;
+            report.journal_syncs = w.syncs;
+        }
         return report;
     }
 
@@ -233,6 +258,23 @@ private:
         return config;
     }
 
+    // One segment and no snapshots, so only the journal thread itself is measured.
+    static std::optional<pipeline::JournalOptions> journal_options(const Options& options) {
+        if (options.journal.empty()) {
+            return std::nullopt;
+        }
+        pipeline::JournalOptions journal;
+        journal.directory = options.journal;
+        journal.writer.sync =
+            options.sync == "sync" ? journal::SyncPolicy::Sync : journal::SyncPolicy::Write;
+        journal.records_per_segment = 0;
+        journal.keep_snapshots = 0;
+        journal.snapshot_thread = false;
+        return journal;
+    }
+
+    // The gateway copies these in its constructor, so they only need to exist until then.
+    std::optional<pipeline::JournalOptions> journal_;
     Exchange exchange_;
 };
 
@@ -360,6 +402,19 @@ void run(const Options& options, Ticker symbol) {
             static_cast<unsigned long long>(report.pump_drains),
             static_cast<unsigned long long>(report.level_updates));
     }
+    if (report.journal) {
+        const double per_commit = report.journal_commits == 0
+                                      ? 0.0
+                                      : static_cast<double>(report.journal_records) /
+                                            static_cast<double>(report.journal_commits);
+        std::printf(
+            "journal: %s, %s, records %llu, commits %llu, syncs %llu, %.2f records per "
+            "commit\n",
+            options.journal.c_str(), options.sync == "sync" ? "sync" : "write",
+            static_cast<unsigned long long>(report.journal_records),
+            static_cast<unsigned long long>(report.journal_commits),
+            static_cast<unsigned long long>(report.journal_syncs), per_commit);
+    }
 }
 
 // Returns nothing if the arguments are wrong.
@@ -420,11 +475,51 @@ std::optional<Options> parse_options(int argc, char** argv) {
             }
             options.sample_every = static_cast<std::uint32_t>(*n);
             i += 2;
+        } else if (flag == "--journal" && left >= 1) {
+            options.journal = argv[i + 1];
+            if (options.journal.empty()) {
+                return std::nullopt;
+            }
+            i += 2;
+        } else if (flag == "--sync" && left >= 1) {
+            options.sync = argv[i + 1];
+            if (options.sync != "write" && options.sync != "sync") {
+                return std::nullopt;
+            }
+            i += 2;
         } else {
             return std::nullopt;
         }
     }
+    // A journal needs the pipeline's journal thread, and --sync only means something
+    // with a journal.
+    if (!options.journal.empty() && options.pipeline == "inline") {
+        return std::nullopt;
+    }
+    if (!options.sync.empty() && options.journal.empty()) {
+        return std::nullopt;
+    }
     return options;
+}
+
+// The journal directory must be new or empty, so a run never starts by recovering an
+// older run's journal.
+bool journal_directory_is_new(const Options& options) {
+    if (options.journal.empty()) {
+        return true;
+    }
+    std::error_code error;
+    if (!std::filesystem::exists(options.journal, error)) {
+        return true;
+    }
+    if (!std::filesystem::is_directory(options.journal, error) ||
+        !std::filesystem::is_empty(options.journal, error)) {
+        std::fprintf(stderr,
+                     "litbook_gateway_latency: the journal directory %s must be new or empty\n",
+                     options.journal.c_str());
+        return false;
+    }
+    return true;
 }
 
 // Every CPU named by --pin must be one this process may use.
@@ -452,12 +547,13 @@ int main(int argc, char** argv) try {
                      "usage: litbook_gateway_latency [ROUND_TRIPS_PER_PASS] [blocking|spin]\n"
                      "       [--pipeline inline|spsc|mutex] "
                      "[--pin CLIENT GATEWAY MATCHING PUBLISHER]\n"
-                     "       [--window N (1 to %zu)] [--sample-every N]\n",
+                     "       [--window N (1 to %zu)] [--sample-every N]\n"
+                     "       [--journal DIR (needs --pipeline spsc|mutex) [--sync write|sync]]\n",
                      kMaxWindow);
         return 2;
     }
     const Options& options = *parsed;
-    if (!pins_allowed(options)) {
+    if (!pins_allowed(options) || !journal_directory_is_new(options)) {
         return 2;
     }
     if (options.client_cpu >= 0 && concurrency::pin_current_thread(options.client_cpu) != 0) {

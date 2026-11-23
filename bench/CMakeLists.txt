@@ -3,7 +3,8 @@ add_executable(litbook_bench
     book_bench.cpp
     protocol_bench.cpp
     queue_bench.cpp
-    feed_bench.cpp)
+    feed_bench.cpp
+    journal_bench.cpp)
 
 # The book benchmarks replay streams from the randomized-test workload generator.
 target_include_directories(litbook_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests)
@@ -57,6 +58,46 @@ if(LITBOOK_BUILD_TESTS)
                          "health: live orders 0, replies [0-9]+, dropped replies 0")
     set_tests_properties(GatewayLatencyBadPipelineTest GatewayLatencyBadWindowTest
                          GatewayLatencyShortPinTest PROPERTIES WILL_FAIL TRUE)
+
+    # With the journal thread (Phase 9). The directories must be new, so a setup test
+    # removes them first, and every run starts from an empty journal. Journals go to /tmp,
+    # the virtual machine's own disk in the dev container (D-060), named after the build
+    # directory so two presets never share one.
+    get_filename_component(litbook_build_name ${CMAKE_BINARY_DIR} NAME)
+    set(litbook_journal_tmp /tmp/litbook_${litbook_build_name})
+    set(latency_journal_spin ${litbook_journal_tmp}/latency_journal_spin)
+    set(latency_journal_sync ${litbook_journal_tmp}/latency_journal_sync)
+    add_test(NAME GatewayLatencyJournalCleanUp
+             COMMAND ${CMAKE_COMMAND} -E rm -rf ${latency_journal_spin} ${latency_journal_sync})
+    set_tests_properties(GatewayLatencyJournalCleanUp PROPERTIES FIXTURES_SETUP latency_journal)
+    add_test(NAME GatewayLatencyJournalSpinSmokeTest
+             COMMAND litbook_gateway_latency 200 spin --pipeline spsc
+                     --journal ${latency_journal_spin})
+    add_test(NAME GatewayLatencyJournalSyncSmokeTest
+             COMMAND litbook_gateway_latency 200 blocking --pipeline mutex
+                     --journal ${latency_journal_sync} --sync sync)
+    set_tests_properties(GatewayLatencyJournalSpinSmokeTest GatewayLatencyJournalSyncSmokeTest
+                         PROPERTIES TIMEOUT 300 FIXTURES_REQUIRED latency_journal)
+    # Every order and cancel of the 6 passes (2 x 200 x 6 = 2,400 frames) is journaled.
+    set_tests_properties(GatewayLatencyJournalSpinSmokeTest PROPERTIES PASS_REGULAR_EXPRESSION
+        "health: live orders 0, replies [0-9]+, dropped replies 0.*journal: [^,]*latency_journal_spin, write, records 24[0-9][0-9], commits [1-9][0-9]*, syncs 0,")
+    set_tests_properties(GatewayLatencyJournalSyncSmokeTest PROPERTIES PASS_REGULAR_EXPRESSION
+        "health: live orders 0, replies [0-9]+, dropped replies 0.*journal: [^,]*latency_journal_sync, sync, records 24[0-9][0-9], commits [1-9][0-9]*, syncs [1-9][0-9]*,")
+    # A journal needs a pipeline, --sync needs a journal and a known policy, and the
+    # directory must not already hold files (this source directory does).
+    add_test(NAME GatewayLatencyJournalInlineTest
+             COMMAND litbook_gateway_latency 200 --journal ${CMAKE_CURRENT_BINARY_DIR}/never)
+    add_test(NAME GatewayLatencyJournalBadSyncTest
+             COMMAND litbook_gateway_latency 200 --pipeline spsc
+                     --journal ${CMAKE_CURRENT_BINARY_DIR}/never --sync maybe)
+    add_test(NAME GatewayLatencySyncWithoutJournalTest
+             COMMAND litbook_gateway_latency 200 --pipeline spsc --sync write)
+    add_test(NAME GatewayLatencyJournalNotEmptyTest
+             COMMAND litbook_gateway_latency 200 --pipeline spsc
+                     --journal ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(GatewayLatencyJournalInlineTest GatewayLatencyJournalBadSyncTest
+                         GatewayLatencySyncWithoutJournalTest GatewayLatencyJournalNotEmptyTest
+                         PROPERTIES WILL_FAIL TRUE)
 endif()
 
 # Passing messages between two threads with SpscQueue and MutexQueue (see the comment at
@@ -97,6 +138,32 @@ if(LITBOOK_BUILD_TESTS)
     set_tests_properties(FeedLatencySpinSmokeTest FeedLatencyBlockingSmokeTest PROPERTIES
         TIMEOUT 300
         PASS_REGULAR_EXPRESSION "health: live orders 0, level updates applied [0-9]+, gaps 0, recoveries 0, dropped by sender 0, ended yes")
+endif()
+
+# How long the exchange takes to start from its journal, with and without a snapshot.
+add_executable(litbook_journal_recovery journal_recovery.cpp)
+target_include_directories(litbook_journal_recovery PRIVATE ${PROJECT_SOURCE_DIR}/tests)
+target_link_libraries(litbook_journal_recovery PRIVATE litbook::litbook litbook::warnings)
+
+if(LITBOOK_BUILD_TESTS)
+    # On /tmp, because on the macOS share of the dev container a file created right after
+    # another of the same name was removed can be listed but not opened.
+    add_test(NAME JournalRecoverySmokeTest
+             COMMAND litbook_journal_recovery --segments 1,3 --segment-records 2000 --tail 1000
+                     --target-live 300 --runs 2
+                     --dir ${litbook_journal_tmp}/journal_recovery_smoke)
+    # With a pass expression ctest ignores the exit code, so a failed check must also be
+    # caught by the fail expression.
+    set_tests_properties(JournalRecoverySmokeTest PROPERTIES
+        TIMEOUT 300
+        PASS_REGULAR_EXPRESSION "health: states agree yes, full replay yes, snapshot used yes, snapshot thread ok"
+        FAIL_REGULAR_EXPRESSION "NO|FAILED|litbook_journal_recovery:")
+    add_test(NAME JournalRecoveryTailTooLongTest
+             COMMAND litbook_journal_recovery --segment-records 2000 --tail 2000)
+    add_test(NAME JournalRecoveryZeroSegmentsTest COMMAND litbook_journal_recovery --segments 0)
+    add_test(NAME JournalRecoveryBadRunsTest COMMAND litbook_journal_recovery --runs x)
+    set_tests_properties(JournalRecoveryTailTooLongTest JournalRecoveryZeroSegmentsTest
+                         JournalRecoveryBadRunsTest PROPERTIES WILL_FAIL TRUE)
 endif()
 
 # How long a late joiner needs to be in step, against the number of stocks.

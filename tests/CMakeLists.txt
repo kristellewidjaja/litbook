@@ -48,6 +48,7 @@ add_executable(litbook_tests
     journal/snapshot_format_test.cpp
     journal/snapshot_replay_test.cpp
     journal/snapshot_store_test.cpp
+    journal/steady_stream_test.cpp
     metrics/latency_histogram_test.cpp
     pipeline/doorbell_test.cpp
     pipeline/feed_worker_test.cpp
@@ -65,6 +66,7 @@ add_executable(litbook_tests
     protocol/codec_test.cpp
     protocol/order_entry_test.cpp
     protocol/order_entry_restore_test.cpp
+    protocol/client_map_key_test.cpp
     metrics/tick_clock_test.cpp)
 
 target_include_directories(litbook_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -2,25 +2,97 @@
 
 A low-latency electronic exchange simulator in modern C++ (C++20).
 
-A *lit* market is a venue with a publicly visible order book, as opposed to a dark pool, where resting orders are hidden. litbook is a lit venue: it matches orders with price-time priority and publishes its book to anyone listening on the market data feed.
+A *lit* market is a venue with a publicly visible order book, as opposed to a dark pool, where resting orders are hidden. litbook is a lit venue. It matches orders with price-time priority and publishes its book to anyone listening on the market data feed.
 
-> **Status:** early development. The reference order book is done: price-time priority matching, market / IOC / FOK / post-only orders, modify with queue-priority rules, self-trade prevention, tick/lot validation, price bands and capacity limits. A second, fast book (flat price ladder, pooled orders, open-addressing ID index) produces the identical event stream, checked by differential tests, and a test proves it makes no heap allocations after startup. A coverage-guided fuzzer compares all three books on every push, and first benchmarks of both books are logged in [BENCHMARKS](docs/BENCHMARKS.md). Per-operation latency percentiles are measured with an in-house HdrHistogram-style histogram. A full Nasdaq TotalView-ITCH 5.0 trading day (268.7 million messages, 8,892 stocks) replays through every book with an exact health check; real data broke the price-ladder book (market-maker stub quotes span $0.0001 to $199,999.99), so a third, sorted-level book was added that holds it without allocating. Profiling with perf showed the timer itself was the biggest cost of the measurement, so the replay now samples one message in 64 and reports the timer's own floor. On top of the books sits a multi-symbol engine and an order entry protocol modeled on Nasdaq OUCH 5.0 (big-endian fixed-length messages, byte layouts in [PROTOCOL](docs/PROTOCOL.md)), with malformed-input tests and a second fuzzer for the decoder. Clients reach it over TCP through a single-threaded epoll gateway speaking SoupBinTCP 3.0 (logins, heartbeats, sequence numbers), with pre-trade risk limits, cancel on disconnect, backpressure for clients that fall behind, a third fuzzer for the session layer, and tests over real sockets. The exchange can also run as a three-thread pipeline (gateway, matching and publisher threads joined by lock-free single-producer single-consumer queues), compared against a mutex queue. The publisher thread sends a market by price data feed in MoldUDP64 packets over UDP multicast, with a snapshot stream so receivers that lose packets or join late get back to correct books (byte layouts in [FEED](docs/FEED.md)), a fourth fuzzer for the feed handler, and tests where the kernel really drops packets. Every request can be written to a write-ahead journal (little-endian records with a CRC32C each) by a fourth thread before the matching thread sees it, so nothing leaves the exchange before its cause is on disk, and the exchange rebuilds itself from the journal at start, with every account's sequence numbers, after a crash. The journal is a directory of segment files, and a fifth thread replays each finished segment into its own copy of the exchange and writes a snapshot of the whole state, so recovery starts from the newest snapshot and old segments can be deleted, while the matching thread never pauses. Crash tests kill it with SIGKILL at random points, also while segments rotate and snapshots are written, and check that the journal explains every reply any client saw and that every snapshot replays to the same state ([JOURNAL](docs/JOURNAL.md)). Results with machine details are in [BENCHMARKS](docs/BENCHMARKS.md).
+## How it works
 
-## Planned components
-- **Matching engine**: a simple reference order book plus a fast, allocation-free book, verified against each other by differential testing and fuzzing
-- **Order entry gateway**: a non-blocking epoll TCP server speaking a fixed-width binary protocol modeled on NASDAQ OUCH
-- **Market data feed**: incremental UDP multicast with sequence numbers, plus a snapshot channel for gap recovery
-- **Persistence**: a write-ahead journal with deterministic replay, snapshots and crash recovery
-- **Tooling**: a NASDAQ TotalView-ITCH 5.0 replayer, a latency histogram, a load generator, and Python trading bots via pybind11
+An exchange takes orders from clients over the network, matches buyers with sellers, tells every client what happened to its own orders, and tells the whole market what the book now looks like. litbook does each of these on its own thread, and the threads hand work to each other through lock-free single-producer, single-consumer queues.
+
+```
+ clients (TCP)                                                  market (UDP multicast)
+      |                                                                  ^
+      v                                                                  |
++-----------+   requests   +-----------+   requests   +-----------+  events  +-----------+
+|  gateway  | -----------> |  journal  | -----------> | matching  | -------> | publisher |
+|  thread   | <----------- |  thread   |              |  thread   |          |  thread   |
++-----------+    replies   +-----------+              +-----------+          +-----------+
+      ^                          |                          |
+      |                          v                          |
+      |                  journal segments  ---> snapshot thread ---> snapshots
+      +----------------------- replies ---------------------+
+```
+
+1. **The gateway thread** runs one `epoll` loop over every client connection. Clients log in and send orders with a binary protocol modeled on Nasdaq's: SoupBinTCP 3.0 for sessions (logins, heartbeats, sequence numbers) and OUCH 5.0 for orders (big-endian, fixed-length messages). The gateway checks each session and hands every request to the next thread. It never matches anything itself, so a slow book never stops it from reading sockets. A client that reads too slowly gets backpressure instead of unbounded buffering.
+2. **The journal thread** writes every request to a write-ahead journal before the matching thread may see it, so nothing leaves the exchange before its cause is on disk. It takes every request that is waiting and writes them with one system call (group commit). Each record carries a sequence number and a CRC32C, computed with the CPU's CRC instruction where there is one.
+3. **The matching thread** owns every order book. It decodes each request, applies the session rules and pre-trade risk limits, and runs the order through its stock's book. It sends replies (accepted, executed, canceled, rejected) back to the gateway, and market events (price level changes and trades) to the publisher. It is deterministic. The same requests in the same order always produce the same replies, which is what makes the journal enough to rebuild the exchange.
+4. **The publisher thread** turns market events into a market by price feed, packed into MoldUDP64 packets and sent over UDP multicast. A second multicast stream repeats a snapshot of every book, so a receiver that loses packets or joins late can rebuild correct books and then follow the live stream again.
+5. **The snapshot thread** keeps its own copy of the exchange. Each time the journal closes a segment file, this thread replays that file into its copy and writes a snapshot of the whole state, so the matching thread never pauses for a snapshot. Old segments are deleted once a snapshot covers them.
+
+Without a journal or a feed, `litbook_gateway` can also run the gateway and matching on one thread, which is the baseline the threaded pipeline is measured against.
+
+After a crash, the exchange starts from the newest good snapshot and replays only the journal records after it. Every account's sequence numbers continue where they stopped, and the feed starts a new session so receivers rebuild their books.
+
+## The order books
+
+Every stock has its own book, and there are three implementations with identical behavior.
+
+- **MapOrderBook** is the reference. It is built from standard containers and written to be simple enough to trust.
+- **FastOrderBook** is a flat price ladder with pooled orders and an open-addressing order index. It never allocates after startup, but it needs a bounded price range.
+- **SortedOrderBook** keeps sorted price levels instead of a ladder. Real Nasdaq data contains quotes from $0.0001 to $199,999.99 in the same stock, which no ladder can hold, so this book handles any price without allocating.
+
+All three support limit, market, immediate or cancel, fill or kill and post-only orders, modifications with the usual queue priority rules, self-trade prevention, tick and lot sizes, price bands and capacity limits.
+
+## How correctness is checked
+
+- **Differential tests and fuzzing.** The three books are run on the same random streams and must produce exactly the same events. Six libFuzzer targets cover the books, the OUCH decoder, the session layer, the feed handler, the journal reader and the snapshot decoder.
+- **Unit tests** for every component, run under AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer with both GCC and Clang, also pinned to two CPUs to match CI.
+- **No-allocation tests** replace the global `operator new` and prove that the books, the pipeline and the journal allocate nothing after startup.
+- **Crash tests** kill the running exchange with SIGKILL at random points, also while segments rotate and snapshots are written. After every kill they check that the journal explains every message any client saw, and that every snapshot replays to the same state as the full journal.
+- **Real market data.** A full Nasdaq TotalView-ITCH 5.0 trading day (268.7 million messages, 8,892 stocks) replays through the books with an exact health check.
+- **Mutation checks.** Bugs are planted on purpose to make sure the tests catch them.
+
+## Some measured numbers
+
+Measured on an Apple M3 Pro, inside a Linux virtual machine under Docker, so treat them as one machine's numbers. Every row, with its date, commit, compiler flags and conditions, is in [BENCHMARKS](docs/BENCHMARKS.md).
+
+| What | Result |
+|---|---|
+| FastOrderBook, rest an order and cancel it | 12.6 ns per operation |
+| A full ITCH trading day through MapOrderBook | 347.2 ns per book message |
+| One client message through the order entry layer, 100,000 live orders | 184.7 ns |
+| TCP round trip through the single-threaded gateway, spin mode, p50 | 9.46 us |
+| TCP round trip through the threaded pipeline with the journal, spin mode, p50 | 13.3 us |
+| From an order on TCP to its price level on the multicast feed, spin mode, p50 | 3.7 us |
+| Recovery from a journal of 4 million requests, without and with snapshots | 551 ms and 18.6 ms |
+
+## Tools
+
+| Program | What it does |
+|---|---|
+| `litbook_gateway` | Runs the exchange, with optional journal, snapshots and market data feed |
+| `litbook_feed_listener` | Joins the multicast feed and keeps books from it |
+| `litbook_journal` | Verifies, dumps or replays a journal, and writes a snapshot offline |
+| `litbook_itch_replay`, `litbook_itch_stats` | Replay a Nasdaq ITCH 5.0 file through a book, or summarize one |
+| `litbook_bench` | Google Benchmark microbenchmarks of every component |
+| `litbook_latency`, `litbook_gateway_latency`, `litbook_queue_latency`, `litbook_feed_latency`, `litbook_feed_recovery`, `litbook_journal_recovery` | Latency percentiles and recovery times |
+
+## Still to come
+
+A C++ load generator with many sessions, Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
 
 ## Building
+
 Development targets Linux. On macOS or Windows, use the Docker dev container (Ubuntu 26.04, GCC 15, Clang 21):
 ```sh
 ./scripts/dev.sh                      # shell inside the container, repo mounted at /work
 cmake --preset debug && cmake --build --preset debug && ctest --preset debug
 ```
-Presets: `debug`, `release`, `asan` (AddressSanitizer + UBSan), `tsan` (ThreadSanitizer), each also as `-clang`.
+Presets are `debug`, `release`, `asan` (AddressSanitizer and UBSan) and `tsan` (ThreadSanitizer), each also as `-clang`. Run benchmarks from the `release` preset only.
 
 ## Docs
-- [Design decisions](docs/DECISIONS.md)
-- [Benchmarks](docs/BENCHMARKS.md): every number comes from a recorded run
+
+- [Design decisions](docs/DECISIONS.md), every choice with the alternative that was rejected
+- [Benchmarks](docs/BENCHMARKS.md), where every number comes from a recorded run
+- [Order entry protocol](docs/PROTOCOL.md), the byte layouts of the OUCH and SoupBinTCP messages
+- [Market data feed](docs/FEED.md), the feed messages, packets and recovery rules
+- [Journal](docs/JOURNAL.md), the journal and snapshot formats and how recovery works

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "book/test_limits.hpp"
+#include "journal/steady_stream.hpp"
 #include "protocol/order_entry_stream.hpp"
 #include "support/unwrap.hpp"
 
@@ -155,12 +156,65 @@ void BM_OrderEntryStream(benchmark::State& state) {
 
 BENCHMARK(BM_DecodeEnterOrder);
 BENCHMARK(BM_DecodeCancelOrder);
+// The cost of one frame once the exchange already holds many live orders. Each iteration
+// grows a fresh exchange to about two thirds of `target` live orders with a steady stream
+// (timer paused), then times the next 100,000 frames of the same stream, which keep it at
+// that size. Run it with --benchmark_repetitions, since each repetition is one iteration.
+void BM_OrderEntrySteady(benchmark::State& state) {
+    const auto target = static_cast<std::size_t>(state.range(0));
+    constexpr std::size_t kTimed = 100'000;
+    testing::SteadyStream stream(2, target);
+    std::vector<testing::InboundFrame> grow;
+    std::vector<testing::InboundFrame> timed;
+    grow.reserve(6 * target);
+    timed.reserve(kTimed);
+    for (std::size_t i = 0; i < 6 * target; ++i) {
+        grow.push_back(stream.next());
+    }
+    for (std::size_t i = 0; i < kTimed; ++i) {
+        timed.push_back(stream.next());
+    }
+    CountingSink sink;
+    std::uint32_t live = 0;
+    for (auto _ : state) {
+        state.PauseTiming();
+        auto entry = std::make_unique<OrderEntry<SortedOrderBook>>(
+            sink, OrderEntryConfig{.max_owners = testing::kSteadyOwners, .max_symbols = 2});
+        for (const char* name : testing::kStreamStocks) {
+            entry->add_symbol(testing::unwrap(make_ticker(name)),
+                              testing::steady_book_config(1U << 18U));
+        }
+        Timestamp now = 0;
+        for (const testing::InboundFrame& frame : grow) {
+            static_cast<void>(entry->on_frame(frame.owner, frame.bytes, ++now));
+        }
+        state.ResumeTiming();
+        for (const testing::InboundFrame& frame : timed) {
+            benchmark::DoNotOptimize(entry->on_frame(frame.owner, frame.bytes, ++now));
+        }
+        state.PauseTiming();
+        live = entry->live_orders();
+        entry.reset();
+        state.ResumeTiming();
+    }
+    state.counters["live"] = static_cast<double>(live);
+    state.counters["time/frame"] = benchmark::Counter(
+        static_cast<double>(kTimed),
+        benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
+}
+
 BENCHMARK(BM_EncodeExecuted);
 BENCHMARK(BM_EncodeAccepted);
 BENCHMARK(BM_DecodeMixedStream);
 BENCHMARK_TEMPLATE(BM_OrderEntryStream, MapOrderBook)->Unit(benchmark::kMillisecond);
 BENCHMARK_TEMPLATE(BM_OrderEntryStream, FastOrderBook)->Unit(benchmark::kMillisecond);
 BENCHMARK_TEMPLATE(BM_OrderEntryStream, SortedOrderBook)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_OrderEntrySteady)
+    ->Arg(1500)
+    ->Arg(15'000)
+    ->Arg(150'000)
+    ->Iterations(1)
+    ->Unit(benchmark::kMillisecond);
 
 }  // namespace
 }  // namespace litbook::protocol

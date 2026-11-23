@@ -261,6 +261,34 @@ Messages that were produced for an account but never reached it are not sent aga
 
 The crash tests (`GatewayJournalCrashTest`) kill `litbook_gateway` with SIGKILL at random points and start it again on the same journal each time. After every kill they replay the journal and check that every message any client ever saw is there, with the same sequence number and the same bytes. Linux can cut a large `write()` short when the process is killed (the copy into the page cache stops between pages), so a torn last record is possible and is accepted. A corrupt journal never is. The second test uses segments of 16 records, so kills also land while segments rotate and snapshots are written. There it also checks after every kill that every snapshot file is whole and continued by the segments, and that replaying the later records from each one ends in exactly the state and reply counts of a full replay. For its last rounds it keeps only 2 snapshots, so old files are also removed under the kills.
 
+## What it costs
+
+Measured on the development machine (an Apple M3 Pro running the Linux VM under Docker, files on the VM's own disk), with the rows, dates and conditions in BENCHMARKS.md (2026-11-23). These runs were made with a browser open, so the medians are the numbers to trust.
+
+| What | Cost |
+|---|---|
+| CRC32C | 2.2 ns per byte with the table, 0.11 ns per byte with the arm64 instruction |
+| Appending one record (encode and CRC, no system call) | 12.7 ns |
+| Commit under Write | 289 ns for one record, 25.6 ns per record in batches of 64 |
+| Commit under Sync | 368 us for one record (the VM's `fdatasync`), 7.5 us per record in batches of 64 |
+| Rotation | 5.4 us under Write, 0.5 ms under Sync |
+| Replay | 108.5 ns per record on FastOrderBook, 119.5 on SortedOrderBook, 149.7 on MapOrderBook |
+| Snapshot of about 100,000 live orders (6.3 MB) | capture 2.0 ms, encode 1.4 ms, decode 3.1 ms, restore 18.3 ms |
+| Snapshot thread, per segment of 100,000 records | about 14 ms (about 6,900 live orders) |
+| Round trip through the pipeline, p50 | about +3 us in spin mode and +18 us in blocking mode with the Write journal; about 0.3 ms with Sync |
+
+Recovery time (`litbook_journal_recovery`, warm page cache, about 6,900 live orders):
+
+| Requests in the journal | Without a snapshot | With the snapshot thread's snapshots |
+|---|---|---|
+| 150,000 | 28.9 ms | 18.9 ms |
+| 550,000 | 84.1 ms | 19.7 ms |
+| 1,050,000 | 147.6 ms | 18.5 ms |
+| 2,050,000 | 282.2 ms | 19.0 ms |
+| 4,050,000 | 551.3 ms | 18.6 ms |
+
+Without a snapshot recovery replays everything, about 136 ns per request. With snapshots it replays only the open segment (here 50,000 requests) after decoding the newest snapshot, so it does not grow with the journal.
+
 ## Tool
 
 ```
