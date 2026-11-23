@@ -85,6 +85,9 @@ class MappedFile {
 public:
     // Throws std::system_error if the file cannot be opened, examined or mapped.
     explicit MappedFile(const std::string& path);
+    // The same, for a path in a fixed buffer. It allocates nothing unless it throws, so a
+    // thread can map files after startup.
+    explicit MappedFile(const char* path);
     ~MappedFile();
 
     MappedFile(const MappedFile&) = delete;

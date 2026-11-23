@@ -1,6 +1,7 @@
 #include "litbook/book/sorted_order_book.hpp"
 #include "litbook/concurrency/mutex_queue.hpp"
 #include "litbook/concurrency/spsc_queue.hpp"
+#include "litbook/journal/journal_directory.hpp"
 #include "litbook/journal/journal_reader.hpp"
 #include "litbook/journal/replay.hpp"
 #include "litbook/journal/setup.hpp"
@@ -175,18 +176,21 @@ struct ExchangeOf<Setup<Q, Mode>> {
 
 template <class S>
 class ThreadedJournalTest : public ::testing::Test {
-protected:
+public:  // The snapshot tests below use the fixture from free helper functions.
     using Exchange = typename ExchangeOf<S>::type;
 
     void SetUp() override {
         g_writes = 0;
         g_fail_from = 0;
+        std::filesystem::create_directories(journal_dir_);
     }
 
     // Builds the exchange on the test's journal. `extra_account` gives it another setup.
     void make(bool extra_account = false, journal::FileOps ops = {}) {
         exchange_.reset();
-        JournalOptions journal{.path = path_};
+        JournalOptions journal{.directory = journal_dir_,
+                               .records_per_segment = records_per_segment_,
+                               .keep_snapshots = keep_snapshots_};
         journal.writer.ops = ops;
         exchange_ = std::make_unique<Exchange>(
             gateway::SessionConfig{.max_connections = 8}, entry_config(),
@@ -232,7 +236,14 @@ protected:
     }
 
     litbook::testing::TempDir dir_;
-    std::string path_ = dir_.file("exchange.journal");
+    // The journal directory. The tests look at its first segment, which holds every
+    // record because the segments are far larger than any test.
+    std::string journal_dir_ = dir_.file("journal");
+    std::string path_ = journal_dir_ + "/" + journal::segment_file_name(1);
+    // The 9b-1 tests check recovery by replaying the whole journal, so they run without
+    // snapshots. The snapshot tests below turn them on.
+    std::size_t keep_snapshots_ = 0;
+    std::uint64_t records_per_segment_ = 1'000'000;
     std::unique_ptr<Exchange> exchange_;
 };
 
@@ -516,12 +527,186 @@ TYPED_TEST(ThreadedJournalTest, TheFinishedEventfdIsReadableOnlyAfterTheExchange
     EXPECT_EQ(::poll(&finished, 1, 0), 1);
 }
 
+// Recovery with snapshots and segments.
+
+// Bob rests `orders` sell orders at different prices, one at a time, and the exchange
+// stops cleanly. Returns the UserRefNum of his last order.
+template <class Test>
+protocol::UserRefNum rest_bob_orders(Test& test, int orders) {
+    test.make();
+    test.exchange_->start();
+    auto bob = test.log_in("bob", "hunter2");
+    for (int i = 1; i <= orders; ++i) {
+        const auto ref = static_cast<protocol::UserRefNum>(i);
+        bob->send(unsequenced(limit(Side::Sell, ref, 10, (50 + i) * kTick)));
+        EXPECT_TRUE(wait_until({bob.get()}, [&] {
+            return bob->template all<protocol::AcceptedMessage>().size() ==
+                   static_cast<std::size_t>(i);
+        }));
+    }
+    test.exchange_->stop();
+    return static_cast<protocol::UserRefNum>(orders);
+}
+
+// After a restart, Alice buys everything Bob has resting, which proves the book came
+// back, and every login number carries on.
+template <class Test>
+void expect_book_back(Test& test, int orders) {
+    auto bob = test.log_in("bob", "hunter2");
+    EXPECT_EQ(test.login_sequence(*bob), static_cast<std::uint64_t>(orders) + 1);
+    auto alice = test.log_in("alice", "secret");
+    alice->send(unsequenced(limit(Side::Buy, 1, static_cast<Qty>(10 * orders), 1000 * kTick)));
+    EXPECT_TRUE(wait_until({alice.get(), bob.get()}, [&] {
+        return bob->template all<protocol::ExecutedMessage>().size() ==
+               static_cast<std::size_t>(orders);
+    }));
+    test.exchange_->stop();
+}
+
+TYPED_TEST(ThreadedJournalTest, ACleanStopWritesASnapshotAndTheRestartStartsFromIt) {
+    this->keep_snapshots_ = 2;
+    rest_bob_orders(*this, 3);
+    const journal::Sequence stop_snapshot = this->exchange_->stop_snapshot();
+    EXPECT_GT(stop_snapshot, 0U);
+    EXPECT_EQ(this->exchange_->stop_snapshot_error(), 0);
+
+    this->make();
+    this->exchange_->start();
+    const RecoveryReport& report = this->exchange_->recovery();
+    EXPECT_TRUE(report.recovered);
+    EXPECT_EQ(report.snapshot_as_of, stop_snapshot);
+    EXPECT_EQ(report.frames, 0U);  // Nothing after the snapshot to replay.
+    EXPECT_EQ(report.replies, 3U);
+    EXPECT_GT(report.start_snapshot, report.restart_sequence);
+    expect_book_back(*this, 3);
+}
+
+TYPED_TEST(ThreadedJournalTest, ADamagedNewestSnapshotFallsBackToTheOneBefore) {
+    this->keep_snapshots_ = 2;
+    rest_bob_orders(*this, 2);
+    const journal::Sequence newest = this->exchange_->stop_snapshot();
+    const journal::DirectoryListing listing = journal::list_journal_directory(this->journal_dir_);
+    ASSERT_EQ(listing.snapshots.size(), 2U);  // The start snapshot and the stop snapshot.
+    {
+        std::fstream file(listing.snapshots.back().path,
+                          std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(60);
+        file.put('\x55');
+    }
+    this->make();
+    this->exchange_->start();
+    const RecoveryReport& report = this->exchange_->recovery();
+    EXPECT_EQ(report.snapshots_refused, 1U);
+    EXPECT_LT(report.snapshot_as_of, newest);
+    EXPECT_EQ(report.snapshot_as_of, listing.snapshots.front().as_of);
+    EXPECT_EQ(report.frames, 2U);  // Bob's two orders came after the start snapshot.
+    expect_book_back(*this, 2);
+    // The damaged file is left for an operator to look at.
+    EXPECT_TRUE(std::filesystem::exists(listing.snapshots.back().path));
+}
+
+TYPED_TEST(ThreadedJournalTest, SegmentsAndTheSnapshotThreadLetOldFilesGo) {
+    this->keep_snapshots_ = 2;
+    this->records_per_segment_ = 4;
+    rest_bob_orders(*this, 12);
+    const auto* snapshots = this->exchange_->snapshotter();
+    ASSERT_NE(snapshots, nullptr);
+    EXPECT_FALSE(snapshots->failed());
+    EXPECT_GT(snapshots->stats().snapshots, 0U);
+    const journal::DirectoryListing listing = journal::list_journal_directory(this->journal_dir_);
+    EXPECT_LE(listing.snapshots.size(), 2U);
+    ASSERT_FALSE(listing.segments.empty());
+    EXPECT_GT(listing.segments.front().first, 1U);  // Segment 1 is gone.
+
+    this->make();
+    this->exchange_->start();
+    EXPECT_GT(this->exchange_->recovery().snapshot_as_of, 0U);
+    expect_book_back(*this, 12);
+}
+
+TYPED_TEST(ThreadedJournalTest,
+           WithoutTheStopSnapshotTheSnapshotThreadsLatestAndTheLaterRecordsAreUsed) {
+    this->keep_snapshots_ = 3;
+    this->records_per_segment_ = 4;
+    rest_bob_orders(*this, 10);
+    const journal::Sequence stop_snapshot = this->exchange_->stop_snapshot();
+    // As if the process had been killed before it could stop cleanly.
+    journal::PathBuffer paths(this->journal_dir_);
+    ASSERT_TRUE(std::filesystem::remove(paths.snapshot(stop_snapshot)));
+
+    this->make();
+    this->exchange_->start();
+    const RecoveryReport& report = this->exchange_->recovery();
+    EXPECT_GT(report.snapshot_as_of, 0U);
+    EXPECT_LT(report.snapshot_as_of, stop_snapshot);
+    EXPECT_EQ(report.stops, 1U);  // The Stop record came after the snapshot.
+    expect_book_back(*this, 10);
+}
+
+TYPED_TEST(ThreadedJournalTest, ACutHeaderAtTheEndIsATornRotationAndIsRemoved) {
+    this->keep_snapshots_ = 2;
+    rest_bob_orders(*this, 1);
+    const std::vector<journal::JournalRecord> records = records_in(this->path_);
+    journal::PathBuffer paths(this->journal_dir_);
+    const std::string torn = paths.segment(records.back().sequence + 1);
+    {
+        std::ofstream(torn, std::ios::binary) << "LIT";
+    }  // The start of the magic.
+    this->make();
+    this->exchange_->start();
+    EXPECT_TRUE(this->exchange_->recovery().torn_rotation);
+    EXPECT_FALSE(std::filesystem::exists(torn));
+    expect_book_back(*this, 1);
+}
+
+TYPED_TEST(ThreadedJournalTest, AMissingSegmentInTheMiddleIsRefused) {
+    this->keep_snapshots_ = 0;  // Nothing is removed, so every segment stays.
+    this->records_per_segment_ = 4;
+    rest_bob_orders(*this, 8);
+    const journal::DirectoryListing listing = journal::list_journal_directory(this->journal_dir_);
+    ASSERT_GE(listing.segments.size(), 3U);
+    std::filesystem::remove(listing.segments[1].path);
+    this->make();
+    try {
+        this->exchange_->start();
+        ADD_FAILURE() << "a journal with a gap must be refused";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("starts at record"), std::string::npos) << e.what();
+    }
+}
+
+TYPED_TEST(ThreadedJournalTest, ASnapshotAndAFullReplayGiveTheSameExchange) {
+    // The same orders on two journals, one with snapshots and one without. After a
+    // restart both exchanges must hold the same state.
+    this->keep_snapshots_ = 2;
+    this->records_per_segment_ = 4;
+    rest_bob_orders(*this, 9);
+    this->make();
+    this->exchange_->start();
+    this->exchange_->stop();
+    protocol::OrderEntryState with_snapshots;
+    this->exchange_->matching().order_entry().capture(with_snapshots);
+
+    this->journal_dir_ = this->dir_.file("plain");
+    std::filesystem::create_directories(this->journal_dir_);
+    this->keep_snapshots_ = 0;
+    rest_bob_orders(*this, 9);
+    this->make();
+    this->exchange_->start();
+    EXPECT_EQ(this->exchange_->recovery().snapshot_as_of, 0U);
+    this->exchange_->stop();
+    protocol::OrderEntryState plain;
+    this->exchange_->matching().order_entry().capture(plain);
+    EXPECT_EQ(with_snapshots, plain);
+    EXPECT_EQ(plain.orders.size(), 9U);
+}
+
 // The market data feed after a restart. FeedWorker writes into a recording sink instead
 // of sockets, which only the publisher thread touches until stop() returned.
 TEST(ThreadedJournalFeedTest, AfterARestartTheFeedHasANewSessionAndTheRebuiltLevels) {
     using Exchange = BasicThreadedGateway<SortedOrderBook, concurrency::SpscQueue, FeedWorker>;
     const litbook::testing::TempDir dir;
-    const JournalOptions journal{.path = dir.file("feed.journal")};
+    const JournalOptions journal{.directory = dir.file("feed")};
     feed::testing::RecordingSink sink;
     FeedWorkerOptions options;
     options.sink = &sink;

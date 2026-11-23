@@ -3,6 +3,7 @@
 #include "litbook/book/order_book.hpp"
 #include "litbook/journal/journal_format.hpp"
 #include "litbook/journal/journal_reader.hpp"
+#include "litbook/journal/snapshot_format.hpp"
 #include "litbook/protocol/codec.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
@@ -24,6 +25,8 @@ enum class ReplayStatus : std::uint8_t {
     RiskLimitsRefused,    // The account of a RiskLimits record does not exist.
     JournalCorrupt,       // The scan found corruption, so nothing was replayed.
     JournalUnreadable,    // The file header is missing or wrong.
+    SnapshotRefused,      // The order entry layer refused the state of a snapshot.
+    AlreadyStarted,       // start_from() was called after a session had started.
 };
 
 std::ostream& operator<<(std::ostream& os, ReplayStatus status);
@@ -36,6 +39,8 @@ struct ReplayStats {
     std::uint64_t cancel_alls = 0;
     std::uint64_t stops = 0;
     std::uint64_t restarts = 0;
+    // Records left out because a snapshot this replay started from already holds them.
+    std::uint64_t skipped = 0;
     Sequence last_sequence = 0;  // The sequence number of the last record applied.
 };
 
@@ -65,6 +70,10 @@ public:
     ReplayStatus apply(const JournalRecord& record) {
         if (status_ != ReplayStatus::Ok) {
             return status_;
+        }
+        if (snapshot_as_of_ != 0 && record.sequence <= snapshot_as_of_) {
+            ++stats_.skipped;
+            return ReplayStatus::Ok;
         }
         now_ = record.now;
         if (!order_entry_ && record.type != RecordType::SessionStart) {
@@ -103,6 +112,37 @@ public:
         return ReplayStatus::Ok;
     }
 
+    // Starts from a snapshot instead of from the journal's first record. Its setup records
+    // build the order entry layer, then its state is restored, and from then on every
+    // record the snapshot already holds (sequence number up to as_of) is skipped. So a
+    // replay can be given whole journal segments that start before the snapshot.
+    ReplayStatus start_from(const Snapshot& snapshot) {
+        if (status_ != ReplayStatus::Ok) {
+            return status_;
+        }
+        if (order_entry_) {
+            return fail(ReplayStatus::AlreadyStarted);
+        }
+        for (const JournalRecord& record : snapshot.setup) {
+            if (apply(record) != ReplayStatus::Ok) {
+                return status_;
+            }
+        }
+        if (!order_entry_) {
+            return fail(ReplayStatus::MissingSessionStart);
+        }
+        try {
+            order_entry_->restore(snapshot.state);
+        } catch (const std::invalid_argument&) {
+            return fail(ReplayStatus::SnapshotRefused);
+        }
+        requests_seen_ = true;  // No setup record may follow a snapshot.
+        snapshot_as_of_ = snapshot.as_of;
+        stats_.last_sequence = snapshot.as_of;
+        now_ = snapshot.as_of_time;
+        return ReplayStatus::Ok;
+    }
+
     [[nodiscard]] bool started() const noexcept { return order_entry_ != nullptr; }
     [[nodiscard]] ReplayStatus status() const noexcept { return status_; }
     [[nodiscard]] const ReplayStats& stats() const noexcept { return stats_; }
@@ -111,6 +151,12 @@ public:
 
     // The rebuilt order entry layer. Throws std::logic_error before SessionStart.
     [[nodiscard]] protocol::OrderEntry<Book>& order_entry() {
+        if (!order_entry_) {
+            throw std::logic_error("the journal has not started a session yet");
+        }
+        return *order_entry_;
+    }
+    [[nodiscard]] const protocol::OrderEntry<Book>& order_entry() const {
         if (!order_entry_) {
             throw std::logic_error("the journal has not started a session yet");
         }
@@ -195,6 +241,7 @@ private:
     Timestamp now_ = 0;
     ReplayStatus status_ = ReplayStatus::Ok;
     bool requests_seen_ = false;
+    Sequence snapshot_as_of_ = 0;  // 0 when the replay did not start from a snapshot.
 };
 
 // What replay_journal did.

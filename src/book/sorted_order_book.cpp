@@ -367,8 +367,18 @@ void SortedOrderBook::cancel_front(Side side, Index level, CancelReason reason) 
 // Resting orders, levels and the intrusive lists.
 
 void SortedOrderBook::rest(const Aggressor& aggressor, bool post_only) {
-    std::vector<Entry>& side = sorted(aggressor.side);
-    const auto [pos, found] = find(aggressor.side, aggressor.limit);
+    const Index level = place({.id = aggressor.id,
+                               .owner = aggressor.owner,
+                               .side = aggressor.side,
+                               .price = aggressor.limit,
+                               .remaining = aggressor.remaining,
+                               .post_only = post_only});
+    emit_level_update(aggressor.side, level);
+}
+
+SortedOrderBook::Index SortedOrderBook::place(const RestingOrder& order) noexcept {
+    std::vector<Entry>& side = sorted(order.side);
+    const auto [pos, found] = find(order.side, order.price);
     Index level = kNone;
     if (found) {
         level = side[pos].level;
@@ -376,24 +386,46 @@ void SortedOrderBook::rest(const Aggressor& aggressor, bool post_only) {
         // Never kNone. Every level holds at least one order, so with a free order node
         // there is also a free level slot.
         level = levels_.acquire();
-        levels_[level] = Level{.price = aggressor.limit};
+        levels_[level] = Level{.price = order.price};
         // Never reallocates, because capacity is max_orders and size < max_orders here.
         side.insert(side.begin() + static_cast<std::ptrdiff_t>(pos),
-                    Entry{.price = aggressor.limit, .level = level});
+                    Entry{.price = order.price, .level = level});
     }
 
     const Index n = orders_.acquire();  // Never kNone, because callers guarantee a free node.
-    orders_[n] = Node{.id = aggressor.id,
-                      .owner = aggressor.owner,
-                      .remaining = aggressor.remaining,
+    orders_[n] = Node{.id = order.id,
+                      .owner = order.owner,
+                      .remaining = order.remaining,
                       .prev = kNone,
                       .next = kNone,
                       .level = level,
-                      .side = aggressor.side,
-                      .post_only = post_only};
-    ids_.insert(aggressor.id, n);  // Cannot fail, since the ID was checked and capacity matches.
+                      .side = order.side,
+                      .post_only = order.post_only};
+    ids_.insert(order.id, n);  // Cannot fail, since the ID was checked and capacity matches.
     link_back(level, n);
-    emit_level_update(aggressor.side, level);
+    return level;
+}
+
+// The checks run in the same order in every book, so they all refuse a bad order for
+// the same reason.
+RestoreStatus SortedOrderBook::restore_resting(const RestingOrder& order) noexcept {
+    if (!on_tick(order.price) || !in_band(order.price)) {
+        return RestoreStatus::BadPrice;
+    }
+    if (order.remaining == 0 || order.remaining % config_.lot_size != 0) {
+        return RestoreStatus::BadQuantity;
+    }
+    if (ids_.contains(order.id)) {
+        return RestoreStatus::DuplicateId;
+    }
+    if (would_cross(order.side, order.price)) {
+        return RestoreStatus::WouldCross;
+    }
+    if (orders_.full()) {
+        return RestoreStatus::BookFull;
+    }
+    place(order);
+    return RestoreStatus::Ok;
 }
 
 void SortedOrderBook::link_back(Index level, Index n) noexcept {

@@ -85,16 +85,18 @@ bool RecordReader::next(JournalRecord& record) noexcept {
     return true;
 }
 
-MappedFile::MappedFile(const std::string& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+MappedFile::MappedFile(const std::string& path) : MappedFile(path.c_str()) {}
+
+MappedFile::MappedFile(const char* path) {
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        throw std::system_error(errno, std::generic_category(), "open " + path);
+        throw std::system_error(errno, std::generic_category(), std::string("open ") + path);
     }
     struct stat info{};
     if (::fstat(fd, &info) != 0) {
         const int error = errno;
         ::close(fd);
-        throw std::system_error(error, std::generic_category(), "fstat " + path);
+        throw std::system_error(error, std::generic_category(), std::string("fstat ") + path);
     }
     size_ = static_cast<std::size_t>(info.st_size);
     // mmap refuses a length of 0, and an empty file has nothing to map anyway.
@@ -104,7 +106,7 @@ MappedFile::MappedFile(const std::string& path) {
             const int error = errno;
             ::close(fd);
             size_ = 0;
-            throw std::system_error(error, std::generic_category(), "mmap " + path);
+            throw std::system_error(error, std::generic_category(), std::string("mmap ") + path);
         }
         data_ = static_cast<const std::byte*>(p);
     }

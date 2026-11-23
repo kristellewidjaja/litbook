@@ -13,6 +13,7 @@ add_executable(litbook_tests
     book/fast_order_book_test.cpp
     book/sorted_order_book_test.cpp
     book/differential_test.cpp
+    book/book_restore_test.cpp
     concurrency/mutex_queue_test.cpp
     concurrency/queue_contract_test.cpp
     concurrency/spsc_queue_test.cpp
@@ -37,15 +38,21 @@ add_executable(litbook_tests
     itch/book_builder_test.cpp
     itch/itch_parser_test.cpp
     journal/crc32c_test.cpp
+    journal/directory_replay_test.cpp
+    journal/journal_directory_test.cpp
     journal/journal_format_test.cpp
     journal/journal_reader_test.cpp
     journal/journal_writer_test.cpp
     journal/replay_test.cpp
     journal/setup_test.cpp
+    journal/snapshot_format_test.cpp
+    journal/snapshot_replay_test.cpp
+    journal/snapshot_store_test.cpp
     metrics/latency_histogram_test.cpp
     pipeline/doorbell_test.cpp
     pipeline/feed_worker_test.cpp
     pipeline/journal_worker_test.cpp
+    pipeline/snapshot_worker_test.cpp
     pipeline/manual_pipeline_test.cpp
     pipeline/matching_worker_test.cpp
     pipeline/messages_test.cpp
@@ -57,9 +64,13 @@ add_executable(litbook_tests
     protocol/byte_order_test.cpp
     protocol/codec_test.cpp
     protocol/order_entry_test.cpp
+    protocol/order_entry_restore_test.cpp
     metrics/tick_clock_test.cpp)
 
 target_include_directories(litbook_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The snapshot format test reads the fuzz seeds that an independent encoder wrote.
+target_compile_definitions(litbook_tests
+    PRIVATE LITBOOK_SNAPSHOT_SEEDS="${PROJECT_SOURCE_DIR}/fuzz/snapshot_seeds")
 
 target_link_libraries(litbook_tests PRIVATE
     litbook::litbook

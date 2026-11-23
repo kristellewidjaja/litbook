@@ -85,6 +85,18 @@ public:
     // Checks every invariant listed above in O(levels + orders) time. Meant for tests.
     [[nodiscard]] bool check_invariants() const;
 
+    // Snapshot calls (see the OrderBook concept). for_each_resting visits one side's
+    // orders, best price first and in priority order within a price, and never allocates.
+    template <class Visit>
+    void for_each_resting(Side side, Visit&& visit) const;
+
+    // Puts one order at the back of its price's queue, with no event and no matching.
+    // Returns why it refused, and then changes nothing. Never allocates.
+    RestoreStatus restore_resting(const RestingOrder& order) noexcept;
+
+    [[nodiscard]] MatchId next_match_id() const noexcept { return next_match_id_; }
+    void restore_next_match_id(MatchId next) noexcept { next_match_id_ = next; }
+
 private:
     using Index = IndexPool<int>::Index;
     static constexpr Index kNone = IndexPool<int>::kNone;
@@ -149,6 +161,11 @@ private:
     void cancel_front(Side side, Index level, CancelReason reason);
 
     void rest(const Aggressor& aggressor, bool post_only);  // Requires a free node in the pool.
+    // Finds or creates the order's level, takes a node, indexes the order and links it at
+    // the back of the level, without any event. Returns the level's slot. Both rest() and
+    // restore_resting() use it, so a restored order is stored exactly like one that came
+    // to rest after matching. Requires a free node.
+    Index place(const RestingOrder& order) noexcept;
     void link_back(Index level, Index node) noexcept;
     void unlink(Index node) noexcept;
     void remove(Index node) noexcept;  // Unlinks the node, forgets its ID and frees it.
@@ -167,6 +184,24 @@ private:
     FlatIdMap ids_;
     MatchId next_match_id_ = 1;
 };
+
+template <class Visit>
+void SortedOrderBook::for_each_resting(Side side, Visit&& visit) const {
+    // The best price is at the back of the array, so this walks it backwards.
+    const std::vector<Entry>& entries = sorted(side);
+    for (std::size_t i = entries.size(); i > 0; --i) {
+        const Level& level = levels_[entries[i - 1].level];
+        for (Index n = level.head; n != kNone; n = orders_[n].next) {
+            const Node& node = orders_[n];
+            visit(RestingOrder{.id = node.id,
+                               .owner = node.owner,
+                               .side = side,
+                               .price = level.price,
+                               .remaining = node.remaining,
+                               .post_only = node.post_only});
+        }
+    }
+}
 
 static_assert(OrderBook<SortedOrderBook>);
 

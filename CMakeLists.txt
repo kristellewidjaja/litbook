@@ -26,6 +26,7 @@ add_library(litbook STATIC
     src/book/events.cpp
     src/book/fast_order_book.cpp
     src/book/map_order_book.cpp
+    src/book/order_book.cpp
     src/book/sorted_order_book.cpp
     src/concurrency/thread_affinity.cpp
     src/engine/engine.cpp
@@ -40,11 +41,15 @@ add_library(litbook STATIC
     src/gateway/soup.cpp
     src/itch/binary_file_reader.cpp
     src/journal/crc32c.cpp
+    src/journal/directory_replay.cpp
+    src/journal/journal_directory.cpp
     src/journal/journal_format.cpp
     src/journal/journal_reader.cpp
     src/journal/journal_writer.cpp
     src/journal/replay.cpp
     src/journal/setup.cpp
+    src/journal/snapshot_format.cpp
+    src/journal/snapshot_store.cpp
     src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)

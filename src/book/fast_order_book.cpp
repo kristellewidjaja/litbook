@@ -360,18 +360,49 @@ void FastOrderBook::cancel_front(Ladder& resting, Side side, std::size_t index,
 // Resting orders and the intrusive lists.
 
 void FastOrderBook::rest(const Aggressor& aggressor, bool post_only) {
-    const Index n = pool_.acquire();  // Never kNone, because callers guarantee a free node.
-    pool_[n] = Node{.id = aggressor.id,
-                    .owner = aggressor.owner,
-                    .remaining = aggressor.remaining,
-                    .prev = kNone,
-                    .next = kNone,
-                    .level = static_cast<std::uint32_t>(aggressor.limit),
-                    .side = aggressor.side,
-                    .post_only = post_only};
-    ids_.insert(aggressor.id, n);  // Cannot fail, since the ID was checked and capacity matches.
-    link_back(ladder(aggressor.side), aggressor.limit, n);
+    place(Node{.id = aggressor.id,
+               .owner = aggressor.owner,
+               .remaining = aggressor.remaining,
+               .level = static_cast<std::uint32_t>(aggressor.limit),
+               .side = aggressor.side,
+               .post_only = post_only});
     emit_level_update(aggressor.side, aggressor.limit);
+}
+
+void FastOrderBook::place(const Node& order) noexcept {
+    const Index n = pool_.acquire();  // Never kNone, because callers guarantee a free node.
+    pool_[n] = order;
+    pool_[n].prev = kNone;
+    pool_[n].next = kNone;
+    ids_.insert(order.id, n);  // Cannot fail, since the ID was checked and capacity matches.
+    link_back(ladder(order.side), order.level, n);
+}
+
+// The checks run in the same order in every book, so they all refuse a bad order for
+// the same reason.
+RestoreStatus FastOrderBook::restore_resting(const RestingOrder& order) noexcept {
+    if (!on_tick(order.price) || !in_band(order.price)) {
+        return RestoreStatus::BadPrice;
+    }
+    if (order.remaining == 0 || order.remaining % config_.lot_size != 0) {
+        return RestoreStatus::BadQuantity;
+    }
+    if (ids_.contains(order.id)) {
+        return RestoreStatus::DuplicateId;
+    }
+    if (would_cross(order.side, order.price)) {
+        return RestoreStatus::WouldCross;
+    }
+    if (pool_.full()) {
+        return RestoreStatus::BookFull;
+    }
+    place(Node{.id = order.id,
+               .owner = order.owner,
+               .remaining = order.remaining,
+               .level = static_cast<std::uint32_t>(to_index(order.price)),
+               .side = order.side,
+               .post_only = order.post_only});
+    return RestoreStatus::Ok;
 }
 
 void FastOrderBook::link_back(Ladder& lad, std::size_t index, Index n) noexcept {

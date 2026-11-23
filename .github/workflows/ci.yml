@@ -46,9 +46,9 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
 
   # Short libFuzzer runs of every fuzz target (the books, the protocol codec, the session
-  # layer, the market data feed and the journal, see fuzz/CMakeLists.txt). The saved
-  # inputs also run in every job above as the *FuzzCorpusReplay tests. This job searches
-  # for new failing inputs.
+  # layer, the market data feed, the journal and its snapshots, see fuzz/CMakeLists.txt).
+  # The saved inputs also run in every job above as the *FuzzCorpusReplay tests. This job
+  # searches for new failing inputs.
   fuzz:
     name: fuzz / clang
     runs-on: ubuntu-24.04
@@ -93,6 +93,12 @@ jobs:
           mkdir -p journal_corpus artifacts
           ./build/fuzz/fuzz/journal_fuzzer -max_total_time=60 -max_len=4096 -timeout=10 \
             -artifact_prefix=artifacts/journal- journal_corpus fuzz/journal_seeds
+
+      - name: Fuzz the journal snapshots for 60 seconds
+        run: |
+          mkdir -p snapshot_corpus artifacts
+          ./build/fuzz/fuzz/snapshot_fuzzer -max_total_time=60 -max_len=8192 -timeout=10 \
+            -artifact_prefix=artifacts/snapshot- snapshot_corpus fuzz/snapshot_seeds
 
       - name: Upload failing inputs
         if: failure()

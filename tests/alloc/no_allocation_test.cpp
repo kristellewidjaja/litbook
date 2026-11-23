@@ -734,7 +734,11 @@ void expect_pipeline_never_allocates() {
         WithFeed ? std::make_unique<FeedReader>() : std::unique_ptr<FeedReader>{};
     const auto publisher_options = publisher_options_for<Exchange>(reader.get());
     const testing::TempDir dir;
-    const pipeline::JournalOptions journal{.path = dir.file("alloc.journal")};
+    // Small segments, so the journal thread rotates during the run. Snapshots are off,
+    // because the snapshots at start and stop and the snapshot thread's cleanup allocate,
+    // and this test counts every allocation in the process.
+    const pipeline::JournalOptions journal{
+        .directory = dir.file("alloc"), .records_per_segment = 1000, .keep_snapshots = 0};
     Exchange exchange(gateway::SessionConfig{.max_connections = 8},
                       {.max_owners = kOwners, .max_live_orders = 4096, .max_symbols = 2},
                       gateway::GatewayConfig{}, pipeline::PipelineConfig{.wait = Mode},

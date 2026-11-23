@@ -11,10 +11,13 @@
 #include "litbook/gateway/epoll_gateway.hpp"
 #include "litbook/gateway/session_manager.hpp"
 #include "litbook/gateway/socket.hpp"
+#include "litbook/journal/journal_directory.hpp"
 #include "litbook/journal/journal_format.hpp"
 #include "litbook/journal/journal_reader.hpp"
 #include "litbook/journal/journal_writer.hpp"
 #include "litbook/journal/setup.hpp"
+#include "litbook/journal/snapshot_format.hpp"
+#include "litbook/journal/snapshot_store.hpp"
 #include "litbook/pipeline/doorbell.hpp"
 #include "litbook/pipeline/journal_worker.hpp"
 #include "litbook/pipeline/matching_worker.hpp"
@@ -22,13 +25,16 @@
 #include "litbook/pipeline/publisher.hpp"
 #include "litbook/pipeline/queue_backend.hpp"
 #include "litbook/pipeline/reply_pump.hpp"
+#include "litbook/pipeline/snapshot_worker.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -59,15 +65,30 @@ struct PipelineConfig {
     int matching_cpu = -1;
     int publisher_cpu = -1;
     int journal_cpu = -1;
+    int snapshot_cpu = -1;
 };
 
-enum class PipelineThread : std::uint8_t { Gateway, Matching, Publisher, Journal };
+enum class PipelineThread : std::uint8_t { Gateway, Matching, Publisher, Journal, Snapshot };
+inline constexpr std::size_t kPipelineThreads = 5;
 
 // Where the journal lives and how it is written. With a journal the pipeline gets a
-// fourth thread, the journal thread, between the gateway and the matching thread.
+// fourth thread, the journal thread, between the gateway and the matching thread, and
+// with snapshots a fifth, the snapshot thread (see docs/JOURNAL.md).
 struct JournalOptions {
-    std::string path;
+    // The journal directory, with its segment and snapshot files. It is created if it
+    // does not exist.
+    std::string directory;
     journal::JournalWriterConfig writer{};
+    // The journal thread starts a new segment after this many records. 0 keeps the
+    // journal in one segment.
+    std::uint64_t records_per_segment = 1'000'000;
+    // How many snapshots to keep. Snapshots are written at every start and at a clean
+    // stop, and older snapshots and the segments they make unnecessary are removed. 0
+    // turns snapshots off, so nothing is ever removed.
+    std::size_t keep_snapshots = 2;
+    // Also take a snapshot each time a segment closes, on a snapshot thread that keeps a
+    // second copy of the exchange. It needs snapshots and segments.
+    bool snapshot_thread = true;
 };
 
 // What start() found in the journal and did with it.
@@ -88,6 +109,17 @@ struct RecoveryReport {
     // Cancel All records written for the accounts with cancel on disconnect, whose
     // connections the crash took away.
     std::uint32_t cancels_on_restart = 0;
+    // The snapshot recovery started from (its as_of), or 0 if it replayed from record 1.
+    journal::Sequence snapshot_as_of = 0;
+    // Snapshot files that could not be used (damaged, or not continued by the segments).
+    std::uint32_t snapshots_refused = 0;
+    std::uint32_t segments = 0;  // Segment files in the journal.
+    // True if the last segment's header was cut short (a crash while it was created), so
+    // the file was removed.
+    bool torn_rotation = false;
+    // The snapshot this start wrote (its as_of), or 0 without snapshots.
+    journal::Sequence start_snapshot = 0;
+    std::uint32_t files_removed = 0;  // Old snapshots and segments removed at start.
 };
 
 // The exchange on three threads, or four with a journal. The gateway thread runs the
@@ -147,6 +179,7 @@ public:
     using Gateway = gateway::BasicEpollGateway<Sessions, Pump>;
     using Worker = MatchingWorker<Book, Requests, Replies, Events>;
     using Journal = JournalWorker<Requests, Requests>;
+    using Snapshotter = SnapshotWorker<Book>;
     using Publisher = PublisherTemplate<Events>;
     using PublisherOptions = typename Publisher::Options;
 
@@ -254,6 +287,9 @@ public:
         if (journal_) {
             journal_thread_ = std::thread([this] { journal_main(); });
         }
+        if (snapshotter_) {
+            snapshot_thread_ = std::thread([this] { snapshot_main(); });
+        }
         gateway_thread_ = std::thread([this] { gateway_main(); });
     }
 
@@ -269,7 +305,12 @@ public:
         join(journal_thread_);
         join(matching_thread_);
         join(publisher_thread_);
+        if (snapshotter_) {
+            snapshotter_->request_stop();
+        }
+        join(snapshot_thread_);
         joined_ = true;
+        write_stop_snapshot();
         for (const std::exception_ptr& error : errors_) {
             if (error) {
                 std::rethrow_exception(error);
@@ -286,6 +327,14 @@ public:
     [[nodiscard]] const Journal* journal() const noexcept {
         return journal_ ? &*journal_ : nullptr;
     }
+    // The snapshot thread's worker, or nullptr without one.
+    [[nodiscard]] const Snapshotter* snapshotter() const noexcept {
+        return snapshotter_ ? &*snapshotter_ : nullptr;
+    }
+    // The snapshot stop() wrote (its as_of), 0 if none, and the errno if writing it failed.
+    // A failed stop snapshot loses nothing, because the journal holds every record.
+    [[nodiscard]] journal::Sequence stop_snapshot() const noexcept { return stop_snapshot_; }
+    [[nodiscard]] int stop_snapshot_error() const noexcept { return stop_snapshot_error_; }
     // 0 if the thread was pinned or not asked to be, otherwise the error number.
     [[nodiscard]] int pin_result(PipelineThread thread) const noexcept {
         return pin_results_[static_cast<std::size_t>(thread)];
@@ -328,6 +377,15 @@ private:
             e.price = update.price;
             e.qty = update.total_qty;
             publisher_->restore(e);
+        }
+
+        // Starts the counts from a snapshot's reply counts.
+        void restore_replies(const std::vector<std::uint64_t>& replies) {
+            for (std::size_t owner = 0; owner < replies.size() && owner < replies_.size();
+                 ++owner) {
+                replies_[owner] = replies[owner];
+                total_ += replies[owner];
+            }
         }
 
         [[nodiscard]] std::uint64_t replies_of(OwnerId owner) const { return replies_.at(owner); }
@@ -391,6 +449,20 @@ private:
         }
         return *journal_;
     }
+    // The names of the journal's files, which exist once open_journal() has started.
+    [[nodiscard]] journal::PathBuffer& paths() {
+        if (!paths_) {
+            throw std::logic_error("the journal directory was not opened");
+        }
+        return *paths_;
+    }
+    // The snapshot thread's worker, which only runs once it exists.
+    [[nodiscard]] Snapshotter& snapshot_worker() {
+        if (!snapshotter_) {
+            throw std::logic_error("the snapshot thread has no worker");
+        }
+        return *snapshotter_;
+    }
 
     // Runs on the journal thread when the journal can no longer be written. Stopping the
     // gateway is only an atomic store and an eventfd write, so any thread may do it.
@@ -402,90 +474,206 @@ private:
     void open_journal() {
         const JournalOptions& options = journal_options();
         const protocol::Timestamp now = clock_();
-        if (!std::filesystem::exists(options.path)) {
+        std::filesystem::create_directories(options.directory);
+        paths_.emplace(options.directory);
+
+        const journal::DirectoryListing listing =
+            journal::list_journal_directory(options.directory);
+        // A snapshot a crash left half written is never used, so it can go.
+        for (const std::string& path : listing.temporary) {
+            std::filesystem::remove(path);
+        }
+        const journal::ChainScan chain = journal::scan_segment_chain(listing);
+        refuse_unusable(chain);
+        recovery_.segments = static_cast<std::uint32_t>(chain.segments.size());
+        if (!chain.torn_rotation.empty()) {
+            std::filesystem::remove(chain.torn_rotation);
+            recovery_.torn_rotation = true;
+        }
+        std::optional<journal::Snapshot> snapshot = choose_snapshot(listing, chain);
+
+        if (chain.status == journal::ChainStatus::Empty) {
+            if (!listing.snapshots.empty()) {
+                throw std::runtime_error("the journal " + options.directory +
+                                         " has snapshots but no segment, so the records "
+                                         "after them are missing");
+            }
             journal::JournalWriter writer =
-                journal::JournalWriter::create(options.path, options.writer);
+                journal::JournalWriter::create(paths().segment(1), options.writer);
             append_setup(writer, now, 0);
             require_written(writer.flush(), "while writing the setup records");
+            start_snapshots(writer, now);
             begin_journal(std::move(writer));
             return;
         }
-
-        RecoverySink sink(worker_.order_entry().config().max_owners, publisher_);
-        journal::JournalScan scan;
-        std::size_t setup_found = 0;
-        {
-            // The file stays mapped only while it is replayed. It must be unmapped before
-            // the writer cuts a torn tail off.
-            const journal::MappedFile file(options.path);
-            scan = journal::scan_journal(file.bytes());
-            refuse_unusable(scan);
-            recovery_.records = scan.records;
-            recovery_.torn_bytes = scan.file_length - scan.valid_length;
-            setup_found = replay_into_worker(file.bytes(), scan, sink);
+        const journal::Sequence first_kept = chain.segments.front().scan.first_sequence;
+        if (!snapshot && first_kept != 1) {
+            throw std::runtime_error("the journal " + options.directory + " starts at record " +
+                                     std::to_string(first_kept) +
+                                     ", and no usable snapshot holds the records before it");
         }
 
+        RecoverySink sink(worker_.order_entry().config().max_owners, publisher_);
+        worker_.redirect_output(sink, sink);
+        const journal::Sequence as_of = snapshot ? snapshot->as_of : 0;
+        if (snapshot) {
+            restore_from_snapshot(*snapshot, sink);
+        }
+        const std::size_t setup_found = replay_segments(chain, as_of, sink);
+
+        const journal::SegmentScan& last = chain.segments.back();
+        recovery_.records = chain.records;
+        recovery_.torn_bytes = last.scan.file_length - last.scan.valid_length;
         journal::JournalWriter writer =
-            journal::JournalWriter::resume(options.path, scan, options.writer);
-        // A journal that ends inside its setup records (a crash during the very first
-        // start) gets the rest of them now. replay_into_worker checked that the ones it
-        // has agree with this start.
-        recovery_.setup_added = setup_.size() - setup_found;
-        append_setup(writer, now, setup_found);
-        if (scan.records > 0) {
+            journal::JournalWriter::resume(last.file.path, last.scan, options.writer);
+        if (!snapshot) {
+            // A journal that ends inside its setup records (a crash during the very first
+            // start) gets the rest of them now. replay_segments checked that the ones it
+            // has agree with this start.
+            recovery_.setup_added = setup_.size() - setup_found;
+            append_setup(writer, now, setup_found);
+        }
+        if (snapshot || chain.records > 0) {
             finish_recovery(writer, now, sink);
         } else {
             require_written(writer.flush(), "while writing the setup records");
         }
         worker_.end_redirect();
+        start_snapshots(writer, now);
         begin_journal(std::move(writer));
     }
 
-    void refuse_unusable(const journal::JournalScan& scan) const {
-        const std::string& path = journal_options().path;
-        if (scan.tail == journal::TailStatus::BadHeader) {
-            std::ostringstream os;
-            os << "the journal " << path << " has a bad file header (" << scan.header
-               << "), so the exchange will not start from it";
-            throw std::runtime_error(os.str());
+    void refuse_unusable(const journal::ChainScan& chain) const {
+        if (chain.status == journal::ChainStatus::Ok ||
+            chain.status == journal::ChainStatus::Empty) {
+            return;
         }
-        if (scan.tail == journal::TailStatus::Corrupt) {
-            std::ostringstream os;
-            os << "the journal " << path << " is corrupt. Its good records stop at byte "
-               << scan.valid_length << ", but another good record starts at byte "
-               << scan.corrupt_at
-               << ". Cutting it there would lose good records, so the exchange will not "
-                  "start from it";
-            throw std::runtime_error(os.str());
+        const std::string& path = chain.problem.file.path;
+        const journal::JournalScan& scan = chain.problem.scan;
+        std::ostringstream os;
+        os << "the journal segment " << path << " ";
+        switch (chain.status) {
+            case journal::ChainStatus::BadSegment:
+                if (scan.tail == journal::TailStatus::BadHeader) {
+                    os << "has a bad file header (" << scan.header << ")";
+                } else {
+                    os << "is corrupt. Its good records stop at byte " << scan.valid_length
+                       << ", but another good record starts at byte " << scan.corrupt_at
+                       << ". Cutting it there would lose good records";
+                }
+                break;
+            case journal::ChainStatus::NameMismatch:
+                os << "has a name that does not match the first record in its header ("
+                   << scan.first_sequence << ")";
+                break;
+            case journal::ChainStatus::Gap:
+                os << "starts at record " << scan.first_sequence
+                   << ", but the segment before it ended before record " << chain.next_sequence;
+                break;
+            case journal::ChainStatus::TornInside:
+                os << "ends with a torn record although later segments follow it";
+                break;
+            case journal::ChainStatus::Ok:
+            case journal::ChainStatus::Empty:
+                break;
+        }
+        os << ", so the exchange will not start from it";
+        throw std::runtime_error(os.str());
+    }
+
+    // Reads every snapshot, newest first. Each one that decodes, has this start's setup
+    // and is continued by the segments is good and kept for retention. The newest good one
+    // is returned. A snapshot written by an exchange with another setup refuses the start.
+    std::optional<journal::Snapshot> choose_snapshot(const journal::DirectoryListing& listing,
+                                                     const journal::ChainScan& chain) {
+        good_snapshots_.clear();
+        std::optional<journal::Snapshot> newest;
+        for (std::size_t k = listing.snapshots.size(); k > 0; --k) {
+            const journal::SnapshotFile& file = listing.snapshots[k - 1];
+            journal::LoadedSnapshot loaded = journal::read_snapshot_file(file);
+            if (loaded.status != journal::SnapshotStatus::Ok) {
+                ++recovery_.snapshots_refused;
+                continue;
+            }
+            require_same_setup(loaded.snapshot.setup, setup_);
+            // The records after the snapshot must be in the segments.
+            if (!journal::snapshot_is_continued(chain, file.as_of)) {
+                ++recovery_.snapshots_refused;
+                continue;
+            }
+            good_snapshots_.insert(good_snapshots_.begin(), file);
+            if (!newest) {
+                newest = std::move(loaded.snapshot);
+            }
+        }
+        return newest;
+    }
+
+    // Puts the matching thread's order entry layer, the reply counts and the feed's level
+    // copy in the state of the snapshot. Nothing is sent.
+    void restore_from_snapshot(const journal::Snapshot& snapshot, RecoverySink& sink) {
+        recovery_.snapshot_as_of = snapshot.as_of;
+        protocol::OrderEntry<Book>& orders = worker_.order_entry();
+        try {
+            orders.restore(snapshot.state);
+        } catch (const std::invalid_argument& e) {
+            throw std::runtime_error("the snapshot as of record " + std::to_string(snapshot.as_of) +
+                                     " in " + journal_options().directory +
+                                     " does not fit this exchange. " + e.what());
+        }
+        sink.restore_replies(snapshot.replies);
+        // The feed's copy of the books is rebuilt from the restored books, level by level,
+        // as if each level had just been updated.
+        sink.set_now(snapshot.as_of_time);
+        const auto& engine = orders.engine();
+        for (std::size_t s = 0; s < engine.symbol_count(); ++s) {
+            const auto symbol = static_cast<SymbolId>(s);
+            const Book& book = *engine.book(symbol);
+            for (const Side side : {Side::Buy, Side::Sell}) {
+                for (const LevelSummary& level : book.depth(side, book.level_count(side))) {
+                    sink.on_level_update(symbol, LevelUpdate{.side = side,
+                                                             .price = level.price,
+                                                             .total_qty = level.total_qty,
+                                                             .order_count = level.order_count});
+                }
+            }
         }
     }
 
-    // Replays every good record of the journal into the matching thread's order entry
-    // layer, with its output going to `sink`. The setup records at the start are compared
-    // with this start's. Returns how many setup records the journal has.
-    std::size_t replay_into_worker(std::span<const std::byte> file,
-                                   const journal::JournalScan& scan, RecoverySink& sink) {
+    // Replays every record after `as_of` of every segment into the matching thread's order
+    // entry layer, with its output going to `sink`. Without a snapshot (as_of 0) the setup
+    // records at the start are compared with this start's. Returns how many setup records
+    // the journal has (0 with a snapshot, which holds the setup itself).
+    std::size_t replay_segments(const journal::ChainScan& chain, journal::Sequence as_of,
+                                RecoverySink& sink) {
         std::vector<journal::JournalRecord> found;
-        bool requests_seen = false;
-        worker_.redirect_output(sink, sink);
-        const std::span<const std::byte> records = file.subspan(
-            journal::kFileHeaderLength, scan.valid_length - journal::kFileHeaderLength);
-        journal::RecordReader reader(records);
-        journal::JournalRecord record;
-        while (reader.next(record)) {
-            if (journal::is_setup_record(record.type)) {
-                if (requests_seen) {
-                    throw std::runtime_error("the journal " + journal_options().path +
-                                             " lists setup records after its first request");
+        bool requests_seen = as_of != 0;
+        for (const journal::SegmentScan& segment : chain.segments) {
+            // Each file stays mapped only while it is replayed. The last one must be
+            // unmapped before the writer cuts a torn tail off.
+            const journal::MappedFile file(segment.file.path);
+            const std::span<const std::byte> records = file.bytes().subspan(
+                journal::kFileHeaderLength, segment.scan.valid_length - journal::kFileHeaderLength);
+            journal::RecordReader reader(records);
+            journal::JournalRecord record;
+            while (reader.next(record)) {
+                if (record.sequence <= as_of) {
+                    continue;
                 }
-                found.push_back(record);
-                continue;
+                if (journal::is_setup_record(record.type)) {
+                    if (requests_seen) {
+                        throw std::runtime_error("the journal " + journal_options().directory +
+                                                 " lists setup records after its first request");
+                    }
+                    found.push_back(record);
+                    continue;
+                }
+                if (!requests_seen) {
+                    requests_seen = true;
+                    require_same_setup(found, setup_);
+                }
+                replay_record(record, sink);
             }
-            if (!requests_seen) {
-                requests_seen = true;
-                require_same_setup(found, setup_);
-            }
-            replay_record(record, sink);
         }
         if (!requests_seen) {
             // Without requests the journal may hold only the first part of the setup.
@@ -507,7 +695,7 @@ private:
                             std::span<const journal::JournalRecord> expected) const {
         const std::string difference = journal::setup_difference(found, expected);
         if (!difference.empty()) {
-            throw std::runtime_error("the journal " + journal_options().path +
+            throw std::runtime_error("the journal " + journal_options().directory +
                                      " was written by an exchange with another setup, so "
                                      "this one will not start from it. " +
                                      difference);
@@ -535,7 +723,123 @@ private:
             case journal::RecordType::SessionStart:
             case journal::RecordType::AddSymbol:
             case journal::RecordType::RiskLimits:
-                return;  // replay_into_worker handles these.
+                return;  // replay_segments handles these.
+        }
+    }
+
+    // A snapshot of the exchange as it is now, as of the last record the writer wrote.
+    // Every account's replies are its next sequence number minus 1.
+    [[nodiscard]] journal::Snapshot snapshot_now(journal::Sequence as_of,
+                                                 protocol::Timestamp now) const {
+        journal::Snapshot s;
+        s.as_of = as_of;
+        s.as_of_time = now;
+        s.setup = setup_;
+        s.replies.assign(static_cast<std::size_t>(worker_.order_entry().config().max_owners) + 1,
+                         0);
+        for (std::size_t i = 1; i <= sessions_.account_count(); ++i) {
+            s.replies[i] = sessions_.next_sequence(static_cast<OwnerId>(i)) - 1;
+        }
+        worker_.order_entry().capture(s.state);
+        return s;
+    }
+
+    // Writes a snapshot file and returns 0 or the errno.
+    int write_snapshot(const journal::Snapshot& s) {
+        std::vector<std::byte> bytes(journal::snapshot_size(s));
+        if (bytes.empty() || journal::encode_snapshot(s, bytes) != bytes.size()) {
+            return ENOBUFS;
+        }
+        return journal::write_snapshot_file(
+            paths(), s.as_of, bytes, journal_options().writer.sync == journal::SyncPolicy::Sync);
+    }
+
+    // Removes the snapshots and segments the good snapshots make unnecessary. Returns how
+    // many files went.
+    std::uint32_t remove_old_files() {
+        const JournalOptions& options = journal_options();
+        const journal::DirectoryListing listing =
+            journal::list_journal_directory(options.directory);
+        std::uint32_t removed = 0;
+        for (const std::string& path :
+             journal::files_to_remove(listing, good_snapshots_, options.keep_snapshots)) {
+            std::error_code ignored;
+            if (std::filesystem::remove(path, ignored)) {
+                ++removed;
+            }
+        }
+        // Keep only the good snapshots that are still on disk.
+        std::erase_if(good_snapshots_, [](const journal::SnapshotFile& file) {
+            return !std::filesystem::exists(file.path);
+        });
+        return removed;
+    }
+
+    // At every start, after recovery and before any thread runs, the state is written as a
+    // snapshot, old files are removed, and the snapshot thread is built from it.
+    void start_snapshots(const journal::JournalWriter& writer, protocol::Timestamp now) {
+        const JournalOptions& options = journal_options();
+        if (options.keep_snapshots == 0) {
+            return;
+        }
+        const journal::Snapshot start = snapshot_now(writer.next_sequence() - 1, now);
+        const int error = write_snapshot(start);
+        if (error != 0) {
+            throw std::system_error(error, std::generic_category(),
+                                    "write the start snapshot in " + options.directory);
+        }
+        recovery_.start_snapshot = start.as_of;
+        good_snapshots_.push_back(
+            journal::SnapshotFile{.as_of = start.as_of, .path = paths().snapshot(start.as_of)});
+        recovery_.files_removed = remove_old_files();
+        if (options.snapshot_thread && options.records_per_segment > 0) {
+            std::vector<journal::Sequence> kept;
+            kept.reserve(good_snapshots_.size());
+            for (const journal::SnapshotFile& file : good_snapshots_) {
+                kept.push_back(file.as_of);
+            }
+            snapshotter_.emplace(
+                SnapshotWorkerOptions{.directory = options.directory,
+                                      .sync = options.writer.sync == journal::SyncPolicy::Sync,
+                                      .keep = options.keep_snapshots},
+                start, writer.file_first_sequence(), kept);
+        }
+    }
+
+    // After a clean stop the live state is written as one more snapshot, so the next start
+    // has nothing to replay. Nothing is written if the journal failed, since the state may
+    // then hold requests the journal does not.
+    void write_stop_snapshot() noexcept {
+        if (!journal_ || !journal_options_ || journal_options_->keep_snapshots == 0 ||
+            journal_->failed() || !journal_->stopped()) {
+            return;
+        }
+        try {
+            if (snapshotter_) {
+                for (const journal::Sequence as_of : snapshotter_->kept()) {
+                    if (std::ranges::none_of(good_snapshots_, [as_of](const auto& file) {
+                            return file.as_of == as_of;
+                        })) {
+                        good_snapshots_.push_back(
+                            journal::SnapshotFile{.as_of = as_of, .path = paths().snapshot(as_of)});
+                    }
+                }
+                std::ranges::sort(good_snapshots_, {}, &journal::SnapshotFile::as_of);
+            }
+            const journal::Sequence as_of = journal_worker().writer().next_sequence() - 1;
+            const journal::Snapshot last = snapshot_now(as_of, clock_());
+            stop_snapshot_error_ = write_snapshot(last);
+            if (stop_snapshot_error_ != 0) {
+                return;
+            }
+            stop_snapshot_ = last.as_of;
+            good_snapshots_.push_back(
+                journal::SnapshotFile{.as_of = last.as_of, .path = paths().snapshot(last.as_of)});
+            remove_old_files();
+        } catch (const std::system_error& e) {
+            stop_snapshot_error_ = e.code().value();
+        } catch (const std::exception&) {
+            stop_snapshot_error_ = EIO;
         }
     }
 
@@ -588,10 +892,14 @@ private:
     }
 
     void begin_journal(journal::JournalWriter writer) {
+        const SegmentOptions segments{
+            .records_per_segment = journal_options().records_per_segment,
+            .paths = &paths(),
+            .listener = snapshotter_ ? static_cast<SegmentListener*>(&*snapshotter_) : nullptr};
         journal_.emplace(std::move(writer), requests_, journaled_, pipeline_.wait,
                          bells_for(pipeline_.wait).requests,
                          blocking() ? &journaled_bell_ : nullptr,
-                         static_cast<JournalFailureListener*>(this));
+                         static_cast<JournalFailureListener*>(this), segments);
     }
 
     void pin(PipelineThread thread, int cpu) noexcept {
@@ -725,6 +1033,15 @@ private:
         }
     }
 
+    void snapshot_main() {
+        try {
+            pin(PipelineThread::Snapshot, pipeline_.snapshot_cpu);
+            snapshot_worker().run();
+        } catch (...) {
+            errors_[static_cast<std::size_t>(PipelineThread::Snapshot)] = std::current_exception();
+        }
+    }
+
     void publisher_main() {
         try {
             pin(PipelineThread::Publisher, pipeline_.publisher_cpu);
@@ -757,15 +1074,22 @@ private:
     std::optional<JournalOptions> journal_options_;
     // This start's setup records, in the order of the startup calls. Only with a journal.
     std::vector<journal::JournalRecord> setup_;
+    std::optional<journal::PathBuffer> paths_;
+    // The snapshots known to be good, oldest first, used to decide what can be removed.
+    std::vector<journal::SnapshotFile> good_snapshots_;
+    std::optional<Snapshotter> snapshotter_;
     std::optional<Journal> journal_;
     RecoveryReport recovery_;
+    journal::Sequence stop_snapshot_ = 0;
+    int stop_snapshot_error_ = 0;
     std::thread publisher_thread_;
     std::thread matching_thread_;
     std::thread journal_thread_;
+    std::thread snapshot_thread_;
     std::thread gateway_thread_;
     // Each slot is written only by its own thread and read after the join.
-    std::array<int, 4> pin_results_{};
-    std::array<std::exception_ptr, 4> errors_{};
+    std::array<int, kPipelineThreads> pin_results_{};
+    std::array<std::exception_ptr, kPipelineThreads> errors_{};
     bool started_ = false;
     bool joined_ = false;
     bool setup_failed_ = false;

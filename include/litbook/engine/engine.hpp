@@ -115,6 +115,17 @@ public:
         return EngineStatus::Ok;
     }
 
+    // Snapshot calls, see OrderEntry::restore. They rebuild a fresh engine's books and
+    // counters without any event. They are startup calls and throw std::out_of_range for
+    // an unknown SymbolId.
+    RestoreStatus restore_resting(SymbolId symbol, const RestingOrder& order) {
+        return slots_.at(symbol)->book.restore_resting(order);
+    }
+    void restore_book_match_id(SymbolId symbol, MatchId next) {
+        slots_.at(symbol)->book.restore_next_match_id(next);
+    }
+    void restore_last_match_id(MatchId last) noexcept { last_match_id_ = last; }
+
     // Read-only access to one stock's book, or nullptr for an unknown SymbolId.
     [[nodiscard]] const Book* book(SymbolId symbol) const noexcept {
         return symbol < slots_.size() ? &slots_[symbol]->book : nullptr;

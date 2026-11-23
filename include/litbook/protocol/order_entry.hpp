@@ -8,6 +8,7 @@
 #include "litbook/protocol/codec.hpp"
 #include "litbook/protocol/messages.hpp"
 #include "litbook/protocol/order_entry_config.hpp"
+#include "litbook/protocol/order_entry_state.hpp"
 #include "litbook/types.hpp"
 
 #include <array>
@@ -16,6 +17,9 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -55,16 +59,11 @@ protected:
     MarketDataSink& operator=(MarketDataSink&&) = default;
 };
 
-// Counts of inbound messages that were dropped without any outbound message. OUCH drops
-// these silently, and the counters make them visible to tests and operators.
-struct OrderEntryStats {
-    std::uint64_t malformed = 0;         // The frame did not decode.
-    std::uint64_t bad_owner = 0;         // The owner was 0 or above max_owners.
-    std::uint64_t stale_user_ref = 0;    // The new UserRefNum was not above the last one.
-    std::uint64_t unknown_order = 0;     // A cancel or replace named no live order.
-    std::uint64_t no_effect_cancel = 0;  // A cancel would not reduce the order.
-    bool operator==(const OrderEntryStats&) const = default;
-};
+// OrderEntryStats and the snapshot state live in order_entry_state.hpp, which uses the
+// plain integer types. These checks keep the two in step.
+static_assert(std::is_same_v<std::uint64_t, OrderRef>);
+static_assert(std::is_same_v<std::uint32_t, UserRefNum>);
+static_assert(std::is_same_v<std::uint16_t, SymbolId>);
 
 // The order entry layer. It owns the matching engine, applies the session rules from
 // docs/PROTOCOL.md, and turns engine events into outbound messages for each account.
@@ -187,6 +186,89 @@ public:
         return account_at(owner).limits;
     }
 
+    // Snapshots (see OrderEntryState for what is kept and in which order).
+
+    // Gives every vector of `state` room for the largest state this layer can have, so a
+    // later capture() into it never allocates. This is a startup call.
+    void reserve_state(OrderEntryState& state) const {
+        state.last_user_ref.reserve(static_cast<std::size_t>(config_.max_owners) + 1);
+        state.orders.reserve(config_.max_live_orders);
+        state.books.reserve(config_.max_symbols);
+        state.resting.reserve(config_.max_live_orders);
+    }
+
+    // Writes this layer's whole state into `state`, replacing what was there. It never
+    // allocates if reserve_state() was called on `state` first, so a thread that keeps a
+    // copy of the exchange can take snapshots after startup.
+    void capture(OrderEntryState& state) const {
+        state.last_order_ref = last_order_ref_;
+        state.last_match_id = engine_.last_match_id();
+        state.stats = stats_;
+        state.last_user_ref.clear();
+        for (const Account& account : accounts_) {
+            state.last_user_ref.push_back(account.last_user_ref);
+        }
+        state.orders.clear();
+        for (std::size_t owner = 1; owner < accounts_.size(); ++owner) {
+            for (Index i = accounts_[owner].first_order; i != kNoRecord;
+                 i = records_[i].next_of_owner) {
+                const Record& r = records_[i];
+                state.orders.push_back(LiveOrderState{.ref = r.ref,
+                                                      .owner = r.owner,
+                                                      .user_ref = r.user_ref,
+                                                      .symbol = r.symbol,
+                                                      .side = r.side,
+                                                      .price = r.price,
+                                                      .open = r.open,
+                                                      .executed = r.executed});
+            }
+        }
+        state.books.clear();
+        state.resting.clear();
+        auto keep = [&state](const RestingOrder& order) { state.resting.push_back(order); };
+        for (std::size_t s = 0; s < engine_.symbol_count(); ++s) {
+            const Book& book = *engine_.book(static_cast<SymbolId>(s));
+            const std::size_t before = state.resting.size();
+            book.for_each_resting(Side::Buy, keep);
+            book.for_each_resting(Side::Sell, keep);
+            state.books.push_back(BookState{
+                .next_match_id = book.next_match_id(),
+                .order_count = static_cast<std::uint32_t>(state.resting.size() - before)});
+        }
+    }
+
+    // Rebuilds this layer from a snapshot, with no outbound message and no market event.
+    // It must be fresh, with the same stocks and risk limits as the layer the state was
+    // captured from and no message handled yet, or it throws std::logic_error. A state
+    // that breaks any invariant of OrderEntryState throws std::invalid_argument with a
+    // sentence that names the first problem, and then this layer must be thrown away.
+    // This is a startup call and allocates.
+    void restore(const OrderEntryState& state) {
+        if (last_order_ref_ != 0 || records_.in_use() != 0 || stats_ != OrderEntryStats{}) {
+            throw std::logic_error("restore() needs an order entry layer that handled nothing");
+        }
+        check_state_shape(state);
+        restore_books(state);
+        restore_records(state);
+        for (std::size_t owner = 1; owner < accounts_.size(); ++owner) {
+            accounts_[owner].last_user_ref = state.last_user_ref[owner];
+        }
+        last_order_ref_ = state.last_order_ref;
+        stats_ = state.stats;
+        engine_.restore_last_match_id(state.last_match_id);
+
+        // Capturing again must give back exactly the same state. This catches a state
+        // whose orders or accounts are not in the order capture() writes them, which the
+        // checks above do not look at.
+        OrderEntryState again;
+        capture(again);
+        if (again != state) {
+            throw std::invalid_argument(
+                "the snapshot is not in canonical order (orders by account, then each "
+                "book best price first)");
+        }
+    }
+
 private:
     // Everything the order entry layer needs to know about one live order.
     struct Record {
@@ -301,6 +383,113 @@ private:
             records_[r.next_of_owner].prev_of_owner = r.prev_of_owner;
         }
         --account.open_orders;
+    }
+
+    // The parts of restore().
+
+    // Checks the sizes and counts of a state before anything is changed.
+    void check_state_shape(const OrderEntryState& state) const {
+        if (state.last_user_ref.size() != accounts_.size() || state.last_user_ref[0] != 0) {
+            throw std::invalid_argument("the snapshot has another number of accounts");
+        }
+        if (state.books.size() != engine_.symbol_count()) {
+            throw std::invalid_argument("the snapshot has another number of stocks");
+        }
+        if (state.orders.size() != state.resting.size()) {
+            throw std::invalid_argument(
+                "the snapshot has a different number of live orders and resting orders");
+        }
+        if (state.orders.size() > config_.max_live_orders) {
+            throw std::invalid_argument("the snapshot has more live orders than max_live_orders");
+        }
+        std::size_t total = 0;
+        for (const BookState& book : state.books) {
+            total += book.order_count;
+        }
+        if (total != state.resting.size()) {
+            throw std::invalid_argument("the snapshot's books do not add up to its resting orders");
+        }
+    }
+
+    // Puts every resting order back into its book, and every book's match counter.
+    void restore_books(const OrderEntryState& state) {
+        std::size_t next = 0;
+        for (std::size_t s = 0; s < state.books.size(); ++s) {
+            const auto symbol = static_cast<SymbolId>(s);
+            for (std::uint32_t k = 0; k < state.books[s].order_count; ++k) {
+                const RestingOrder& order = state.resting[next];
+                ++next;
+                const RestoreStatus status = engine_.restore_resting(symbol, order);
+                if (status != RestoreStatus::Ok) {
+                    throw std::invalid_argument("the book of stock " + std::to_string(s) +
+                                                " refused order " + std::to_string(order.id) +
+                                                " of the snapshot");
+                }
+            }
+            engine_.restore_book_match_id(symbol, state.books[s].next_match_id);
+        }
+    }
+
+    // Rebuilds one record per live order, after checking that it agrees with the order
+    // resting in its book. link_to_owner() puts a record at the front of its account's
+    // list, so walking the orders backwards rebuilds every list in its original order.
+    void restore_records(const OrderEntryState& state) {
+        std::unordered_map<std::uint64_t, const RestingOrder*> resting_by_ref;
+        for (const RestingOrder& order : state.resting) {
+            resting_by_ref.emplace(order.id, &order);
+        }
+        for (std::size_t k = state.orders.size(); k > 0; --k) {
+            const LiveOrderState& order = state.orders[k - 1];
+            check_live_order(state, order, resting_by_ref);
+            const Index i = records_.acquire();
+            records_[i] = Record{.ref = order.ref,
+                                 .owner = order.owner,
+                                 .user_ref = order.user_ref,
+                                 .symbol = order.symbol,
+                                 .side = order.side,
+                                 .price = order.price,
+                                 .open = order.open,
+                                 .executed = order.executed,
+                                 .prev_of_owner = kNoRecord,
+                                 .next_of_owner = kNoRecord};
+            by_client_.insert(client_key(order.owner, order.user_ref), i);
+            by_ref_.insert(order.ref, i);
+            link_to_owner(i);
+        }
+    }
+
+    void check_live_order(
+        const OrderEntryState& state, const LiveOrderState& order,
+        const std::unordered_map<std::uint64_t, const RestingOrder*>& resting_by_ref) const {
+        const std::string which = "live order " + std::to_string(order.ref) + " of the snapshot";
+        if (order.owner == kNoOwner || order.owner > config_.max_owners) {
+            throw std::invalid_argument(which + " has no valid account");
+        }
+        if (order.symbol >= engine_.symbol_count()) {
+            throw std::invalid_argument(which + " names a stock that is not listed");
+        }
+        if (order.ref == 0 || order.ref > state.last_order_ref) {
+            throw std::invalid_argument(which + " has a reference number never handed out");
+        }
+        if (order.user_ref == 0 || order.user_ref > state.last_user_ref[order.owner]) {
+            throw std::invalid_argument(which + " has a UserRefNum its account never used");
+        }
+        if (order.open == 0) {
+            throw std::invalid_argument(which + " has nothing open");
+        }
+        if (by_ref_.contains(order.ref) ||
+            by_client_.contains(client_key(order.owner, order.user_ref))) {
+            throw std::invalid_argument(which + " is listed twice");
+        }
+        const auto found = resting_by_ref.find(order.ref);
+        if (found == resting_by_ref.end() || !engine_.book(order.symbol)->contains(order.ref)) {
+            throw std::invalid_argument(which + " does not rest in its book");
+        }
+        const RestingOrder& resting = *found->second;
+        if (resting.owner != order.owner || resting.side != order.side ||
+            resting.price != order.price || resting.remaining != order.open) {
+            throw std::invalid_argument(which + " does not match the order in its book");
+        }
     }
 
     void release(Index i) noexcept {

@@ -78,6 +78,18 @@ public:
     // Checks every invariant listed above in O(levels + orders) time. Meant for tests.
     [[nodiscard]] bool check_invariants() const;
 
+    // Snapshot calls (see the OrderBook concept). for_each_resting visits one side's
+    // orders, best price first and in priority order within a price, and never allocates.
+    template <class Visit>
+    void for_each_resting(Side side, Visit&& visit) const;
+
+    // Puts one order at the back of its price's queue, with no event and no matching.
+    // Returns why it refused, and then changes nothing. Never allocates.
+    RestoreStatus restore_resting(const RestingOrder& order) noexcept;
+
+    [[nodiscard]] MatchId next_match_id() const noexcept { return next_match_id_; }
+    void restore_next_match_id(MatchId next) noexcept { next_match_id_ = next; }
+
 private:
     using Index = IndexPool<int>::Index;
     static constexpr Index kNone = IndexPool<int>::kNone;
@@ -141,6 +153,11 @@ private:
     void cancel_front(Ladder& resting, Side side, std::size_t index, CancelReason reason);
 
     void rest(const Aggressor& aggressor, bool post_only);  // Requires a free node in the pool.
+    // Copies `order` into a free node, indexes it and links it at the back of the level
+    // order.level, without any event. Its prev and next are set here. Both rest() and
+    // restore_resting() use it, so a restored order is stored exactly like one that came
+    // to rest after matching. Requires a free node.
+    void place(const Node& order) noexcept;
     void link_back(Ladder& ladder, std::size_t index, Index node) noexcept;
     void unlink(Ladder& ladder, Index node) noexcept;
     void remove(Index node) noexcept;  // Unlinks the node, forgets its ID and frees it.
@@ -157,6 +174,23 @@ private:
     FlatIdMap ids_;
     MatchId next_match_id_ = 1;
 };
+
+template <class Visit>
+void FastOrderBook::for_each_resting(Side side, Visit&& visit) const {
+    const Ladder& lad = ladder(side);
+    for (std::size_t i = lad.best; i != kNoLevel; i = next_worse(lad, side, i)) {
+        const Price price = to_price(i);
+        for (Index n = lad.levels[i].head; n != kNone; n = pool_[n].next) {
+            const Node& node = pool_[n];
+            visit(RestingOrder{.id = node.id,
+                               .owner = node.owner,
+                               .side = side,
+                               .price = price,
+                               .remaining = node.remaining,
+                               .post_only = node.post_only});
+        }
+    }
+}
 
 static_assert(OrderBook<FastOrderBook>);
 

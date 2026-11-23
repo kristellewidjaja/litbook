@@ -67,6 +67,7 @@ struct JournalWriterStats {
     std::uint64_t interrupted = 0;     // write() calls interrupted by a signal (EINTR).
     std::uint64_t syncs = 0;           // fdatasync() calls.
     std::uint64_t bytes_written = 0;   // Bytes the kernel took, the file header included.
+    std::uint64_t rotations = 0;       // Times rotate() moved on to a new file.
     int last_error = 0;                // errno of the failure that stopped the writer.
 };
 
@@ -129,6 +130,20 @@ public:
     // Writes every buffered record whatever the policy, and syncs under Sync.
     JournalStatus flush();
 
+    // Moves on to a new journal file, which is how a journal is split into segments. It
+    // flushes everything buffered into the current file, creates `path` (which must not
+    // exist), writes its header with the next sequence number as its first one, and then
+    // closes the old file. Under Sync the new file and `directory` (the folder that holds
+    // it) are synced too, so its name survives a power loss. It keeps the same buffer and
+    // never allocates, so the journal thread can call it between batches. A file that
+    // cannot be created counts as WriteFailed, and any failure stops the writer. If the
+    // current file holds no record yet, there is nothing to close, so it returns Ok and
+    // does nothing (the new file would have the current file's own name).
+    JournalStatus rotate(const char* path, const char* directory);
+
+    // The sequence number of the first record of the current file.
+    [[nodiscard]] Sequence file_first_sequence() const noexcept { return file_first_; }
+
     [[nodiscard]] Sequence next_sequence() const noexcept { return next_sequence_; }
     [[nodiscard]] std::size_t pending_bytes() const noexcept { return pending_; }
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
@@ -137,7 +152,8 @@ public:
     [[nodiscard]] const JournalWriterStats& stats() const noexcept { return stats_; }
 
 private:
-    JournalWriter(int fd, const JournalWriterConfig& config, Sequence next_sequence);
+    JournalWriter(int fd, const JournalWriterConfig& config, Sequence file_first,
+                  Sequence next_sequence);
 
     // Gives the encoded record its room in the buffer. `encode` writes it there.
     template <class Encode>
@@ -149,6 +165,7 @@ private:
     JournalWriterConfig config_;
     std::vector<std::byte> buffer_;
     std::size_t pending_ = 0;  // Bytes at the front of buffer_ waiting to be written.
+    Sequence file_first_ = 1;  // The first sequence number of the current file.
     Sequence next_sequence_ = 1;
     bool stopped_ = false;
     JournalWriterStats stats_;

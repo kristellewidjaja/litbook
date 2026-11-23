@@ -4,7 +4,8 @@
 //   litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... [--symbol TICKER]...
 //                   [--max-order-qty N] [--max-open-orders N]
 //                   [--feed INTERFACE] [--feed-incremental ADDRESS:PORT]
-//                   [--feed-snapshot ADDRESS:PORT] [--journal PATH] [--sync write|sync]
+//                   [--feed-snapshot ADDRESS:PORT] [--journal DIRECTORY] [--sync write|sync]
+//                   [--segment-records N] [--keep-snapshots K] [--snapshot-thread on|off]
 //
 // --port 0 lets the kernel pick a free port. The first line printed is always
 // "litbook_gateway listening on 127.0.0.1:PORT", so scripts and tests can find the port.
@@ -19,13 +20,23 @@
 // printed then says where the feed goes. litbook_feed_listener reads it.
 //
 // With --journal the exchange also runs on the pipeline, with a fourth thread that writes
-// every request to the journal file before the matching thread handles it
-// (docs/JOURNAL.md). If the file exists, the exchange first rebuilds itself from it, so a
-// restart after a crash carries on where the journal ends, and every account's sequence
-// numbers carry on too. The accounts, stocks and limits on the command line must be the
-// same as when the journal was started. A line after the listening line (and the feed
-// line) says what was found. --sync sync calls fdatasync after every batch of requests,
-// and the default, write, survives a crash of the process but not of the machine.
+// every request to the journal before the matching thread handles it (docs/JOURNAL.md).
+// The journal is a directory of segment files and snapshot files, created if it does not
+// exist. If it holds a journal, the exchange first rebuilds itself from the newest usable
+// snapshot and the records after it, so a restart after a crash carries on where the
+// journal ends, and every account's sequence numbers carry on too. The accounts, stocks
+// and limits on the command line must be the same as when the journal was started. A line
+// after the listening line (and the feed line) says what was found. --sync sync calls
+// fdatasync after every batch of requests, and the default, write, survives a crash of
+// the process but not of the machine.
+//
+// --segment-records starts a new segment file after that many records (default
+// 1,000,000, and 0 keeps one segment). --keep-snapshots says how many snapshots to keep
+// (default 2). A snapshot is written at every start and at a clean stop, and older
+// snapshots and the segments they cover are removed. 0 turns snapshots off, and then
+// nothing is ever removed. --snapshot-thread on (the default) also takes a snapshot each
+// time a segment closes, on a fifth thread that keeps a second copy of the exchange. It
+// needs segments and snapshots, so asking for it without them is a usage error.
 //
 // SIGINT (Ctrl-C) or SIGTERM stops the server. It then ends the session, so clients get
 // End of Session (and feed listeners too), prints its counters and exits with 0. Bad
@@ -60,6 +71,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -95,9 +107,12 @@ struct Options {
     std::optional<litbook::feed::FeedNetworkConfig> feed;
     std::optional<litbook::feed::MulticastGroup> feed_incremental;
     std::optional<litbook::feed::MulticastGroup> feed_snapshot;
-    // Set by --journal and --sync.
+    // Set by --journal and the flags after it, which all need --journal.
     std::optional<std::string> journal;
     std::optional<litbook::journal::SyncPolicy> sync;
+    std::optional<std::uint64_t> segment_records;
+    std::optional<std::uint64_t> keep_snapshots;
+    std::optional<bool> snapshot_thread;
 };
 
 // Parses "ADDRESS:PORT" for a feed group, or returns false.
@@ -189,6 +204,15 @@ bool parse_options(int argc, char** argv, Options& o) {
             o.sync = litbook::journal::SyncPolicy::Write;
         } else if (flag == "--sync" && value == "sync") {
             o.sync = litbook::journal::SyncPolicy::Sync;
+        } else if (flag == "--segment-records" &&
+                   parse_unsigned(value, 0xFFFF'FFFF'FFFFULL, number)) {
+            o.segment_records = number;
+        } else if (flag == "--keep-snapshots" && parse_unsigned(value, 1'000'000, number)) {
+            o.keep_snapshots = number;
+        } else if (flag == "--snapshot-thread" && value == "on") {
+            o.snapshot_thread = true;
+        } else if (flag == "--snapshot-thread" && value == "off") {
+            o.snapshot_thread = false;
         } else {
             return false;
         }
@@ -197,8 +221,15 @@ bool parse_options(int argc, char** argv, Options& o) {
     if (!o.feed && (o.feed_incremental || o.feed_snapshot)) {
         return false;
     }
-    // And --sync only with a journal.
-    if (!o.journal && o.sync) {
+    // And the journal flags only with a journal.
+    const bool journal_flags = o.sync || o.segment_records || o.keep_snapshots || o.snapshot_thread;
+    if (!o.journal && journal_flags) {
+        return false;
+    }
+    // The snapshot thread snapshots each closed segment, so it needs both.
+    const bool no_segments = o.segment_records.value_or(1) == 0;
+    const bool no_snapshots = o.keep_snapshots.value_or(1) == 0;
+    if (o.snapshot_thread.value_or(false) && (no_segments || no_snapshots)) {
         return false;
     }
     if (o.feed && o.feed_incremental) {
@@ -268,19 +299,80 @@ int run_single_threaded(const Options& o, const std::vector<litbook::Ticker>& ti
     return 0;
 }
 
-// Prints what start() found in the journal.
+// The end of the recovery line, about the snapshot this start wrote.
+void print_start_snapshot(const litbook::pipeline::RecoveryReport& r) {
+    if (r.start_snapshot == 0) {
+        std::printf("; snapshots off\n");
+        return;
+    }
+    std::printf("; start snapshot as of %llu, files removed %u\n",
+                static_cast<unsigned long long>(r.start_snapshot), r.files_removed);
+}
+
+// Prints what start() found in the journal, on one line.
 void print_recovery(const std::string& path, const litbook::pipeline::RecoveryReport& r) {
     if (!r.recovered) {
-        std::printf("litbook_gateway journal %s: new\n", path.c_str());
+        std::printf("litbook_gateway journal %s: new", path.c_str());
+        print_start_snapshot(r);
         return;
     }
     std::printf(
         "litbook_gateway journal %s: recovered %llu records (torn bytes cut %zu), replayed "
-        "%llu frames and %llu cancel alls, replies %llu, restart %llu, cancels on restart %u\n",
+        "%llu frames and %llu cancel alls, replies %llu, restart %llu, cancels on restart %u",
         path.c_str(), static_cast<unsigned long long>(r.records), r.torn_bytes,
         static_cast<unsigned long long>(r.frames), static_cast<unsigned long long>(r.cancel_alls),
         static_cast<unsigned long long>(r.replies),
         static_cast<unsigned long long>(r.restart_sequence), r.cancels_on_restart);
+    std::printf("; segments %u, ", r.segments);
+    if (r.snapshot_as_of == 0) {
+        std::printf("from record 1");
+    } else {
+        std::printf("from snapshot as of %llu", static_cast<unsigned long long>(r.snapshot_as_of));
+    }
+    std::printf(", snapshots refused %u", r.snapshots_refused);
+    if (r.torn_rotation) {
+        std::printf(", torn rotation removed");
+    }
+    print_start_snapshot(r);
+}
+
+// The text for an errno value. std::strerror may share one buffer between threads, and
+// this does not.
+std::string error_text(int error) {
+    return std::generic_category().message(error);
+}
+
+// The last line, with the journal thread's and the snapshot thread's counters.
+template <class Exchange>
+void print_journal_stats(const Exchange& exchange) {
+    const auto* worker = exchange.journal();
+    if (worker == nullptr) {
+        return;
+    }
+    const litbook::journal::JournalWriterStats& w = worker->writer().stats();
+    std::printf(
+        "journal: records %llu, commits %llu, syncs %llu, next sequence %llu, rotations %llu",
+        static_cast<unsigned long long>(w.records), static_cast<unsigned long long>(w.commits),
+        static_cast<unsigned long long>(w.syncs),
+        static_cast<unsigned long long>(worker->writer().next_sequence()),
+        static_cast<unsigned long long>(w.rotations));
+    if (const auto* snapshots = exchange.snapshotter()) {
+        const litbook::pipeline::SnapshotWorkerStats& s = snapshots->stats();
+        std::printf("; snapshot thread snapshots %llu, removed %llu",
+                    static_cast<unsigned long long>(s.snapshots),
+                    static_cast<unsigned long long>(s.removed));
+        if (s.failures > 0) {
+            std::printf(", failed (%s)", error_text(s.last_error).c_str());
+        }
+    }
+    if (exchange.stop_snapshot_error() != 0) {
+        std::printf("; stop snapshot failed (%s)",
+                    error_text(exchange.stop_snapshot_error()).c_str());
+    } else if (exchange.stop_snapshot() != 0) {
+        std::printf("; stop snapshot as of %llu",
+                    static_cast<unsigned long long>(exchange.stop_snapshot()));
+    }
+    std::printf("\n");
 }
 
 // Blocks SIGINT and SIGTERM in this thread, before any other thread starts (they inherit
@@ -328,8 +420,14 @@ int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
     std::optional<litbook::pipeline::JournalOptions> journal;
     if (o.journal) {
         journal.emplace();
-        journal->path = *o.journal;
+        journal->directory = *o.journal;
         journal->writer.sync = o.sync.value_or(litbook::journal::SyncPolicy::Write);
+        journal->records_per_segment = o.segment_records.value_or(journal->records_per_segment);
+        journal->keep_snapshots = o.keep_snapshots.value_or(journal->keep_snapshots);
+        // Without segments or snapshots the thread would have nothing to do, so the
+        // default turns it off then.
+        const bool possible = journal->records_per_segment > 0 && journal->keep_snapshots > 0;
+        journal->snapshot_thread = o.snapshot_thread.value_or(possible);
     }
     Exchange exchange(litbook::gateway::SessionConfig{}, order_entry_config(o),
                       litbook::gateway::GatewayConfig{.port = o.port},
@@ -353,7 +451,7 @@ int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
                     static_cast<unsigned>(feed->snapshot.port));
     }
     if (journal) {
-        print_recovery(journal->path, exchange.recovery());
+        print_recovery(journal->directory, exchange.recovery());
     }
     std::fflush(stdout);
 
@@ -374,13 +472,7 @@ int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
             static_cast<unsigned long long>(snapshot.sent),
             static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(failed));
     }
-    if (const auto* worker = exchange.journal()) {
-        std::printf("journal: records %llu, commits %llu, syncs %llu, next sequence %llu\n",
-                    static_cast<unsigned long long>(worker->writer().stats().records),
-                    static_cast<unsigned long long>(worker->writer().stats().commits),
-                    static_cast<unsigned long long>(worker->writer().stats().syncs),
-                    static_cast<unsigned long long>(worker->writer().next_sequence()));
-    }
+    print_journal_stats(exchange);
     return 0;
 }
 
@@ -402,7 +494,8 @@ int main(int argc, char** argv) try {
                      "usage: litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... "
                      "[--symbol TICKER]... [--max-order-qty N] [--max-open-orders N] "
                      "[--feed INTERFACE] [--feed-incremental ADDRESS:PORT] "
-                     "[--feed-snapshot ADDRESS:PORT] [--journal PATH] [--sync write|sync]\n");
+                     "[--feed-snapshot ADDRESS:PORT] [--journal DIRECTORY] [--sync write|sync] "
+                     "[--segment-records N] [--keep-snapshots K] [--snapshot-thread on|off]\n");
         return 2;
     }
     std::vector<litbook::Ticker> tickers;

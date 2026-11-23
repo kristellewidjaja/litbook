@@ -51,8 +51,13 @@ void check_config(const JournalWriterConfig& config) {
 
 }  // namespace
 
-JournalWriter::JournalWriter(int fd, const JournalWriterConfig& config, Sequence next_sequence)
-    : fd_(fd), config_(config), buffer_(config.buffer_capacity), next_sequence_(next_sequence) {}
+JournalWriter::JournalWriter(int fd, const JournalWriterConfig& config, Sequence file_first,
+                             Sequence next_sequence)
+    : fd_(fd),
+      config_(config),
+      buffer_(config.buffer_capacity),
+      file_first_(file_first),
+      next_sequence_(next_sequence) {}
 
 JournalWriter JournalWriter::create(const std::string& path, const JournalWriterConfig& config,
                                     Sequence first_sequence) {
@@ -65,7 +70,7 @@ JournalWriter JournalWriter::create(const std::string& path, const JournalWriter
     if (fd < 0) {
         throw_errno(errno, "create journal " + path);
     }
-    JournalWriter writer(fd, config, first_sequence);
+    JournalWriter writer(fd, config, first_sequence, first_sequence);
     writer.pending_ = encode_file_header(writer.buffer_, first_sequence);
     if (writer.flush() != JournalStatus::Ok) {
         throw_errno(writer.stats_.last_error, "write journal header " + path);
@@ -88,7 +93,7 @@ JournalWriter JournalWriter::resume(const std::string& path, const JournalScan& 
     if (fd < 0) {
         throw_errno(errno, "open journal " + path);
     }
-    JournalWriter writer(fd, config, scan.next_sequence);
+    JournalWriter writer(fd, config, scan.first_sequence, scan.next_sequence);
     struct stat info{};
     if (::fstat(fd, &info) != 0) {
         throw_errno(errno, "fstat journal " + path);
@@ -120,6 +125,7 @@ JournalWriter::JournalWriter(JournalWriter&& other) noexcept
       config_(other.config_),
       buffer_(std::move(other.buffer_)),
       pending_(std::exchange(other.pending_, 0)),
+      file_first_(other.file_first_),
       next_sequence_(other.next_sequence_),
       stopped_(other.stopped_),
       stats_(other.stats_) {}
@@ -131,6 +137,7 @@ JournalWriter& JournalWriter::operator=(JournalWriter&& other) noexcept {
         config_ = other.config_;
         buffer_ = std::move(other.buffer_);
         pending_ = std::exchange(other.pending_, 0);
+        file_first_ = other.file_first_;
         next_sequence_ = other.next_sequence_;
         stopped_ = other.stopped_;
         stats_ = other.stats_;
@@ -245,6 +252,48 @@ JournalStatus JournalWriter::write_pending(bool force) {
         ++stats_.syncs;
         if (config_.ops.sync(fd_) != 0) {
             stats_.last_error = errno;
+            stopped_ = true;
+            return JournalStatus::SyncFailed;
+        }
+    }
+    return JournalStatus::Ok;
+}
+
+JournalStatus JournalWriter::rotate(const char* path, const char* directory) {
+    const JournalStatus flushed = flush();
+    if (flushed != JournalStatus::Ok) {
+        return flushed;
+    }
+    if (next_sequence_ == file_first_) {
+        return JournalStatus::Ok;  // The current file has no record, so it stays open.
+    }
+    // O_EXCL, as in create(), so an existing segment is never overwritten.
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        stats_.last_error = errno;
+        stopped_ = true;
+        return JournalStatus::WriteFailed;
+    }
+    // The old file has everything and was synced by flush() under Sync, so it can close.
+    close_file();
+    fd_ = fd;
+    file_first_ = next_sequence_;
+    ++stats_.rotations;
+    pending_ = encode_file_header(buffer_, next_sequence_);
+    const JournalStatus header = flush();
+    if (header != JournalStatus::Ok) {
+        return header;
+    }
+    if (config_.sync == SyncPolicy::Sync) {
+        const int dir = ::open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const int rc = dir < 0 ? -1 : ::fsync(dir);
+        const int error = errno;
+        if (dir >= 0) {
+            ::close(dir);
+        }
+        ++stats_.syncs;
+        if (rc != 0) {
+            stats_.last_error = error;
             stopped_ = true;
             return JournalStatus::SyncFailed;
         }

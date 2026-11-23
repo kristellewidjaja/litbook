@@ -3,7 +3,9 @@
 
 #include "litbook/book/sorted_order_book.hpp"
 #include "litbook/journal/crc32c.hpp"
+#include "litbook/journal/journal_directory.hpp"
 #include "litbook/journal/journal_writer.hpp"
+#include "litbook/journal/snapshot_store.hpp"
 #include "litbook/protocol/byte_order.hpp"
 #include "litbook/protocol/order_entry.hpp"
 
@@ -20,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "journal/journal_builder.hpp"
 #include "journal/replay_test_support.hpp"
 #include "support/temp_dir.hpp"
 #include "tools/child_process.hpp"
@@ -214,6 +217,217 @@ TEST_F(JournalToolTest, BadArgumentsAndUnreadableFilesExitWithTwo) {
     EXPECT_EQ(run.exit_code, 3);
     EXPECT_TRUE(run.has("header BadMagic"));
     EXPECT_EQ(run_tool({"replay", dir_.file("text")}).exit_code, 3);
+}
+
+// The directory commands. Each test writes a journal directory with segments (and
+// sometimes snapshots) through the builder, which also knows the true state.
+class JournalToolDirectoryTest : public ::testing::Test {
+protected:
+    // 200 records, a snapshot, then two more segments of 200 and 100.
+    void write_three_segments_and_a_snapshot() {
+        builder_.append(200);
+        write_snapshot();
+        builder_.rotate();
+        builder_.append(200);
+        builder_.rotate();
+        builder_.append(100);
+    }
+
+    void write_snapshot() {
+        const Snapshot s = builder_.snapshot();
+        ASSERT_EQ(write_snapshot_file(builder_.paths(), s.as_of, testing::encoded(s), false), 0);
+        snapshot_as_of_ = s.as_of;
+    }
+
+    [[nodiscard]] std::string segment_name(Sequence first) const {
+        return segment_file_name(first);
+    }
+
+    // The lines replay prints for each account's next sequence number.
+    void expect_next_sequences(const ToolRun& run) const {
+        const std::vector<std::uint64_t> counts = builder_.reply_counts();
+        for (std::size_t owner = 1; owner < counts.size(); ++owner) {
+            if (counts[owner] > 0) {
+                EXPECT_TRUE(run.has("account " + std::to_string(owner) + " next sequence " +
+                                    std::to_string(counts[owner] + 1)))
+                    << "account " << owner;
+            }
+        }
+        EXPECT_TRUE(run.has_prefix("live orders " +
+                                   std::to_string(builder_.reference().live_orders()) + ", "));
+    }
+
+    TempDir dir_;
+    testing::JournalBuilder builder_{dir_.path()};
+    Sequence snapshot_as_of_ = 0;
+};
+
+TEST_F(JournalToolDirectoryTest, VerifyListsTheSegmentsTheSnapshotsAndWhereRecoveryStarts) {
+    write_three_segments_and_a_snapshot();
+    const ToolRun run = run_tool({"verify", dir_.path()});
+    EXPECT_EQ(run.exit_code, 0);
+    EXPECT_TRUE(run.has("journal directory " + dir_.path()));
+    EXPECT_TRUE(run.has_prefix("segment " + segment_name(1) + ": first sequence 1, records "));
+    const std::size_t setup = testing::replay_setup_records().size();
+    const Sequence second = setup + 200 + 1;
+    EXPECT_TRUE(run.has("segment " + segment_name(second) + ": first sequence " +
+                        std::to_string(second) + ", records 200, tail clean"));
+    EXPECT_TRUE(run.has("chain ok, records " + std::to_string(setup + 500) + ", next sequence " +
+                        std::to_string(builder_.next_sequence())));
+    EXPECT_TRUE(run.has("snapshot " + snapshot_file_name(snapshot_as_of_) + ": as of " +
+                        std::to_string(snapshot_as_of_) + ", ok"));
+    EXPECT_TRUE(
+        run.has("recovery starts from the snapshot as of " + std::to_string(snapshot_as_of_)));
+}
+
+TEST_F(JournalToolDirectoryTest, ReplayFromTheSnapshotAndFromTheStartAgree) {
+    write_three_segments_and_a_snapshot();
+    const ToolRun from_snapshot = run_tool({"replay", dir_.path()});
+    EXPECT_EQ(from_snapshot.exit_code, 0);
+    EXPECT_TRUE(from_snapshot.has("start snapshot as of " + std::to_string(snapshot_as_of_)));
+    EXPECT_TRUE(from_snapshot.has("skipped " + std::to_string(snapshot_as_of_) +
+                                  " records the snapshot already holds"));
+    expect_next_sequences(from_snapshot);
+
+    const ToolRun from_start = run_tool({"replay", dir_.path(), "--from-start"});
+    EXPECT_EQ(from_start.exit_code, 0);
+    EXPECT_TRUE(from_start.has("start record 1"));
+    expect_next_sequences(from_start);
+    // From the start, the digest covers every reply the reference produced.
+    DigestReplies digest;
+    for (const testing::RecordedReply& reply : builder_.replies()) {
+        digest.send(reply.owner, reply.bytes);
+    }
+    std::array<char, 96> line{};
+    std::snprintf(line.data(), line.size(), "replies %llu crc32c %08x",
+                  static_cast<unsigned long long>(digest.count), digest.crc);
+    EXPECT_TRUE(from_start.has(line.data())) << line.data();
+}
+
+TEST_F(JournalToolDirectoryTest, DumpWalksEverySegmentInOrder) {
+    write_three_segments_and_a_snapshot();
+    const ToolRun run = run_tool({"dump", dir_.path()});
+    EXPECT_EQ(run.exit_code, 0);
+    EXPECT_TRUE(run.has("segment " + segment_name(1)));
+    EXPECT_TRUE(run.has_prefix("1 t=1 SessionStart "));
+    EXPECT_TRUE(run.has_prefix(std::to_string(builder_.next_sequence() - 1) + " t="));
+    const ToolRun limited = run_tool({"dump", dir_.path(), "--limit", "2"});
+    EXPECT_EQ(limited.exit_code, 0);
+    const std::size_t setup = testing::replay_setup_records().size();
+    EXPECT_TRUE(limited.has("... " + std::to_string(setup + 500 - 2) + " more records"));
+}
+
+TEST_F(JournalToolDirectoryTest, SnapshotWritesAFileThatEqualsTheTrueState) {
+    builder_.append(300);
+    builder_.rotate();
+    builder_.append(100);
+    const ToolRun run = run_tool({"snapshot", dir_.path()});
+    EXPECT_EQ(run.exit_code, 0);
+    const Sequence as_of = builder_.next_sequence() - 1;
+    EXPECT_TRUE(run.has("start record 1"));
+    EXPECT_TRUE(run.has_prefix("snapshot as of " + std::to_string(as_of) + " written to " +
+                               snapshot_file_name(as_of) + " ("));
+    const LoadedSnapshot written =
+        read_snapshot_file(SnapshotFile{.as_of = as_of, .path = builder_.paths().snapshot(as_of)});
+    ASSERT_EQ(written.status, SnapshotStatus::Ok);
+    EXPECT_EQ(written.snapshot, builder_.snapshot());
+
+    // A second run starts from that snapshot and writes the same bytes again.
+    const std::vector<std::byte> first = testing::encoded(written.snapshot);
+    const ToolRun again = run_tool({"snapshot", dir_.path()});
+    EXPECT_EQ(again.exit_code, 0);
+    EXPECT_TRUE(again.has("start snapshot as of " + std::to_string(as_of)));
+    EXPECT_EQ(
+        testing::encoded(read_snapshot_file(
+                             SnapshotFile{.as_of = as_of, .path = builder_.paths().snapshot(as_of)})
+                             .snapshot),
+        first);
+
+    // Once the snapshot covers the first segment, it can go, and only --from-start fails.
+    std::filesystem::remove(builder_.paths().segment(1));
+    EXPECT_EQ(run_tool({"verify", dir_.path()}).exit_code, 0);
+    expect_next_sequences(run_tool({"replay", dir_.path()}));
+    const ToolRun from_start = run_tool({"replay", dir_.path(), "--from-start"});
+    EXPECT_EQ(from_start.exit_code, 3);
+    EXPECT_TRUE(from_start.has_prefix("replay failed: the first segment starts at record "));
+}
+
+TEST_F(JournalToolDirectoryTest, ASnapshotOnTopOfAnEarlierOneAddsTheLaterReplies) {
+    write_three_segments_and_a_snapshot();
+    const ToolRun run = run_tool({"snapshot", dir_.path()});
+    EXPECT_EQ(run.exit_code, 0);
+    EXPECT_TRUE(run.has("start snapshot as of " + std::to_string(snapshot_as_of_)));
+    const Sequence as_of = builder_.next_sequence() - 1;
+    const LoadedSnapshot written =
+        read_snapshot_file(SnapshotFile{.as_of = as_of, .path = builder_.paths().snapshot(as_of)});
+    ASSERT_EQ(written.status, SnapshotStatus::Ok);
+    // The reply counts are the earlier snapshot's plus the replies after it.
+    EXPECT_EQ(written.snapshot.replies, builder_.reply_counts());
+    EXPECT_EQ(written.snapshot, builder_.snapshot());
+}
+
+TEST_F(JournalToolDirectoryTest, ADamagedSnapshotIsRefusedAndRecoveryFallsBack) {
+    builder_.append(100);
+    write_snapshot();
+    {
+        const File f(std::fopen(builder_.paths().snapshot(snapshot_as_of_), "r+b"), &std::fclose);
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fseek(f.get(), 50, SEEK_SET), 0);
+        ASSERT_NE(std::fputc(0xEE, f.get()), EOF);
+    }
+    const ToolRun run = run_tool({"verify", dir_.path()});
+    EXPECT_EQ(run.exit_code, 0);
+    EXPECT_TRUE(run.has("snapshot " + snapshot_file_name(snapshot_as_of_) + ": as of " +
+                        std::to_string(snapshot_as_of_) + ", refused (BadChecksum)"));
+    EXPECT_TRUE(run.has("recovery starts from record 1"));
+    const ToolRun replay = run_tool({"replay", dir_.path()});
+    EXPECT_TRUE(replay.has("start record 1"));
+    expect_next_sequences(replay);
+}
+
+TEST_F(JournalToolDirectoryTest, AMissingSegmentIsRefusedWithExitCodeThree) {
+    builder_.append(100);
+    const auto [first, second] = builder_.rotate();
+    builder_.append(100);
+    builder_.rotate();
+    builder_.append(100);
+    std::filesystem::remove(builder_.paths().segment(second));
+    const ToolRun run = run_tool({"verify", dir_.path()});
+    EXPECT_EQ(run.exit_code, 3);
+    EXPECT_TRUE(run.has_prefix("chain Gap at segment "));
+    EXPECT_EQ(run_tool({"replay", dir_.path()}).exit_code, 3);
+    EXPECT_EQ(run_tool({"snapshot", dir_.path()}).exit_code, 3);
+    EXPECT_EQ(first, 1U);
+}
+
+TEST_F(JournalToolDirectoryTest, ATornRotationGivesExitCodeOne) {
+    builder_.append(100);
+    const auto [first, next] = builder_.rotate();
+    // A crash while the new segment's header was written leaves only its start.
+    std::filesystem::resize_file(builder_.paths().segment(next), 10);
+    const ToolRun run = run_tool({"verify", dir_.path()});
+    EXPECT_EQ(run.exit_code, 1);
+    EXPECT_TRUE(run.has("segment " + segment_name(next) +
+                        ": header cut short while it was created (a torn rotation)"));
+    EXPECT_EQ(run_tool({"replay", dir_.path()}).exit_code, 1);
+    EXPECT_EQ(first, 1U);
+}
+
+TEST(JournalToolDirectoryArguments, EmptyDirectoriesAndWrongPathsAreRefused) {
+    const TempDir dir;
+    const ToolRun empty = run_tool({"verify", dir.path()});
+    EXPECT_EQ(empty.exit_code, 3);
+    EXPECT_TRUE(empty.has("chain empty, the directory holds no segment"));
+    EXPECT_EQ(run_tool({"replay", dir.path()}).exit_code, 3);
+    // snapshot needs a directory, and --from-start only means something for one.
+    const std::string file = dir.file("one.journal");
+    {
+        const JournalWriter writer = JournalWriter::create(file, JournalWriterConfig{});
+    }
+    EXPECT_EQ(run_tool({"snapshot", file}).exit_code, 2);
+    EXPECT_EQ(run_tool({"replay", file, "--from-start"}).exit_code, 2);
+    EXPECT_EQ(run_tool({"snapshot"}).exit_code, 2);
+    EXPECT_EQ(run_tool({"replay", dir.path(), "--sideways"}).exit_code, 2);
 }
 
 }  // namespace

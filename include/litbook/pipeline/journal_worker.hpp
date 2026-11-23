@@ -2,6 +2,7 @@
 
 #include "litbook/concurrency/cpu_relax.hpp"
 #include "litbook/concurrency/message_queue.hpp"
+#include "litbook/journal/journal_directory.hpp"
 #include "litbook/journal/journal_format.hpp"
 #include "litbook/journal/journal_writer.hpp"
 #include "litbook/pipeline/doorbell.hpp"
@@ -12,6 +13,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace litbook::pipeline {
@@ -29,6 +31,31 @@ protected:
     JournalFailureListener(JournalFailureListener&&) = default;
     JournalFailureListener& operator=(const JournalFailureListener&) = default;
     JournalFailureListener& operator=(JournalFailureListener&&) = default;
+};
+
+// Hears, on the journal thread, that a journal segment was closed. `first` is the first
+// sequence number of the closed segment and `next` the first of the new one, so the
+// closed segment holds the records first to next - 1. The snapshot thread uses it to
+// learn that there is a finished file to read. It must not block.
+class SegmentListener {
+public:
+    virtual ~SegmentListener() = default;
+    virtual void on_segment_closed(journal::Sequence first, journal::Sequence next) noexcept = 0;
+
+protected:
+    SegmentListener() = default;
+    SegmentListener(const SegmentListener&) = default;
+    SegmentListener(SegmentListener&&) = default;
+    SegmentListener& operator=(const SegmentListener&) = default;
+    SegmentListener& operator=(SegmentListener&&) = default;
+};
+
+// How the journal thread splits the journal into segments. With records_per_segment 0
+// (the default) it never rotates and the journal stays one file.
+struct SegmentOptions {
+    std::uint64_t records_per_segment = 0;
+    journal::PathBuffer* paths = nullptr;  // Names the new segments. Needed to rotate.
+    SegmentListener* listener = nullptr;   // May be nullptr.
 };
 
 // The most requests the journal thread takes for one commit. A batch is copied into an
@@ -62,6 +89,11 @@ struct JournalWorkerStats {
 // Stop arrives. Stop is still passed on, so the matching thread answers Stopped and the
 // pipeline shuts down normally.
 //
+// With segments, the worker rotates to a new segment file once the current one holds at
+// least records_per_segment records. That happens after a batch was passed on, so it
+// never delays the batch, and only between batches, so a batch is never split across two
+// files. A failed rotation stops the journal like a failed write.
+//
 // step() handles one batch and can be called by hand, which is how the single-threaded
 // tests drive it. run() loops until it has handled Stop.
 //
@@ -76,8 +108,10 @@ class JournalWorker {
 public:
     // `in_bell` wakes this thread in WaitMode::Block and `out_bell` wakes the matching
     // thread. Both are nullptr when the threads spin. `listener` may be nullptr.
+    // Throws std::invalid_argument if segments are asked for without a PathBuffer.
     JournalWorker(journal::JournalWriter writer, InQueue& in, OutQueue& out, WaitMode mode,
-                  Doorbell* in_bell, Doorbell* out_bell, JournalFailureListener* listener)
+                  Doorbell* in_bell, Doorbell* out_bell, JournalFailureListener* listener,
+                  const SegmentOptions& segments = {})
         : writer_(std::move(writer)),
           in_(&in),
           out_(&out),
@@ -85,6 +119,7 @@ public:
           in_bell_(in_bell),
           out_bell_(out_bell),
           listener_(listener),
+          segments_(checked(segments)),
           batch_limit_(batch_limit_for(writer_.capacity())) {}
 
     JournalWorker(const JournalWorker&) = delete;
@@ -126,6 +161,9 @@ public:
         }
         ring(out_bell_);
         stopped_ = ends_with_stop;
+        if (!stopped_) {
+            rotate_if_full();
+        }
         return true;
     }
 
@@ -150,6 +188,34 @@ public:
     [[nodiscard]] const journal::JournalWriter& writer() const noexcept { return writer_; }
 
 private:
+    static SegmentOptions checked(SegmentOptions segments) {
+        if (segments.records_per_segment > 0 && segments.paths == nullptr) {
+            throw std::invalid_argument("journal segments need a PathBuffer to name them");
+        }
+        return segments;
+    }
+
+    // Starts a new segment once the current one is full, and tells the listener.
+    void rotate_if_full() {
+        if (segments_.records_per_segment == 0) {
+            return;
+        }
+        const journal::Sequence first = writer_.file_first_sequence();
+        const journal::Sequence next = writer_.next_sequence();
+        if (next - first < segments_.records_per_segment) {
+            return;
+        }
+        const journal::JournalStatus status =
+            writer_.rotate(segments_.paths->segment(next), segments_.paths->directory());
+        if (status != journal::JournalStatus::Ok) {
+            fail(status);
+            return;
+        }
+        if (segments_.listener != nullptr) {
+            segments_.listener->on_segment_closed(first, next);
+        }
+    }
+
     // A batch must always fit in the writer's buffer, so an append never finds it full.
     static std::size_t batch_limit_for(std::size_t capacity) noexcept {
         return std::clamp<std::size_t>(capacity / journal::kMaxRecordLength, 1, kMaxJournalBatch);
@@ -261,6 +327,7 @@ private:
     Doorbell* in_bell_;
     Doorbell* out_bell_;
     JournalFailureListener* listener_;
+    SegmentOptions segments_;
     std::size_t batch_limit_;
     std::array<Request, kMaxJournalBatch> batch_{};
     JournalWorkerStats stats_;

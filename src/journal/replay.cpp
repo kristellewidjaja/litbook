@@ -24,6 +24,10 @@ std::ostream& operator<<(std::ostream& os, ReplayStatus status) {
             return os << "JournalCorrupt";
         case ReplayStatus::JournalUnreadable:
             return os << "JournalUnreadable";
+        case ReplayStatus::SnapshotRefused:
+            return os << "SnapshotRefused";
+        case ReplayStatus::AlreadyStarted:
+            return os << "AlreadyStarted";
     }
     return os << "ReplayStatus(" << static_cast<int>(status) << ")";
 }

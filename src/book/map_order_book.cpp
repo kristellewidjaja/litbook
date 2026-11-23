@@ -104,7 +104,7 @@ bool MapOrderBook::can_fill_completely(const Aggressor& aggressor) const {
             if (!crosses(aggressor.side, aggressor.limit, price)) {
                 return false;
             }
-            for (const RestingOrder& order : level.orders) {
+            for (const QueuedOrder& order : level.orders) {
                 if (is_self_trade(aggressor.owner, order.owner)) {
                     return false;
                 }
@@ -215,7 +215,7 @@ void MapOrderBook::modify(OrderId id, Price new_price, Qty new_qty) {
         return reject(RejectReason::InvalidLotSize);
     }
     const Location location = found->second;
-    const RestingOrder order = *location.order;  // A copy, since the node may be erased below.
+    const QueuedOrder order = *location.order;  // A copy, since the node may be erased below.
     if (order.post_only && would_cross(location.side, new_price)) {
         return reject(RejectReason::PostOnlyWouldCross);
     }
@@ -286,7 +286,7 @@ void MapOrderBook::match_against(Levels& levels, Aggressor& aggressor) {
 
         Level& level = level_it->second;
         while (aggressor.remaining > 0 && !level.orders.empty()) {
-            RestingOrder& resting = level.orders.front();  // Highest priority at this price.
+            QueuedOrder& resting = level.orders.front();  // Highest priority at this price.
             if (is_self_trade(aggressor.owner, resting.owner)) {
                 prevent_self_trade(level, resting_side, level_price, aggressor);
                 continue;
@@ -342,7 +342,7 @@ void MapOrderBook::prevent_self_trade(Level& level, Side resting_side, Price pri
             cancel_aggressor(aggressor.remaining);
             return;
         case SelfTradePolicy::Decrement: {
-            RestingOrder& resting = level.orders.front();
+            QueuedOrder& resting = level.orders.front();
             const Qty reduce = std::min(aggressor.remaining, resting.remaining);
             resting.remaining -= reduce;
             level.total_qty -= reduce;
@@ -364,7 +364,7 @@ void MapOrderBook::prevent_self_trade(Level& level, Side resting_side, Price pri
 }
 
 void MapOrderBook::cancel_front(Level& level, Side side, Price price, CancelReason reason) {
-    const RestingOrder front = level.orders.front();
+    const QueuedOrder front = level.orders.front();
     level.total_qty -= front.remaining;
     index_.erase(front.id);
     level.orders.pop_front();
@@ -376,18 +376,50 @@ void MapOrderBook::cancel_front(Level& level, Side side, Price price, CancelReas
 }
 
 void MapOrderBook::rest(const Aggressor& aggressor, bool post_only) {
-    with_levels(aggressor.side, [&](auto& levels) {
-        Level& level = levels[aggressor.limit];  // creates an empty level if the price is new
-        level.orders.push_back({.id = aggressor.id,
+    const Level& level = place({.id = aggressor.id,
                                 .owner = aggressor.owner,
+                                .side = aggressor.side,
+                                .price = aggressor.limit,
                                 .remaining = aggressor.remaining,
                                 .post_only = post_only});
-        level.total_qty += aggressor.remaining;
-        index_.emplace(aggressor.id, Location{.side = aggressor.side,
-                                              .price = aggressor.limit,
-                                              .order = std::prev(level.orders.end())});
-        emit_level_update(aggressor.side, aggressor.limit, level);
+    emit_level_update(aggressor.side, aggressor.limit, level);
+}
+
+const MapOrderBook::Level& MapOrderBook::place(const RestingOrder& order) {
+    return with_levels(order.side, [&](auto& levels) -> const Level& {
+        Level& level = levels[order.price];  // creates an empty level if the price is new
+        level.orders.push_back({.id = order.id,
+                                .owner = order.owner,
+                                .remaining = order.remaining,
+                                .post_only = order.post_only});
+        level.total_qty += order.remaining;
+        index_.emplace(order.id, Location{.side = order.side,
+                                          .price = order.price,
+                                          .order = std::prev(level.orders.end())});
+        return level;
     });
+}
+
+// The checks run in the same order in every book, so they all refuse a bad order for
+// the same reason.
+RestoreStatus MapOrderBook::restore_resting(const RestingOrder& order) {
+    if (!valid_price(order.price) || !in_band(order.price)) {
+        return RestoreStatus::BadPrice;
+    }
+    if (order.remaining == 0 || !valid_qty(order.remaining)) {
+        return RestoreStatus::BadQuantity;
+    }
+    if (index_.contains(order.id)) {
+        return RestoreStatus::DuplicateId;
+    }
+    if (would_cross(order.side, order.price)) {
+        return RestoreStatus::WouldCross;
+    }
+    if (index_.size() >= config_.max_orders) {
+        return RestoreStatus::BookFull;
+    }
+    place(order);
+    return RestoreStatus::Ok;
 }
 
 void MapOrderBook::emit_level_update(Side side, Price price, const Level& level) {

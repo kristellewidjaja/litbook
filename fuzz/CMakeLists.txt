@@ -1,10 +1,11 @@
-# There are five fuzz targets. Each one is a small library that defines
+# There are six fuzz targets. Each one is a small library that defines
 # litbook::fuzz::run_one (see fuzz_target.hpp).
 #   book_fuzzer      differential test of all three books against the naive oracle
 #   protocol_fuzzer  decoder robustness and canonical re-encoding of the wire codec
 #   session_fuzzer   the SoupBinTCP session layer fed random bytes, splits and timing
 #   feed_fuzzer      the market data feed handler fed raw packets, and recovery over a lossy channel
 #   journal_fuzzer   the journal scanner fed raw files, and replay of built, cut and damaged journals
+#   snapshot_fuzzer  the snapshot decoder fed raw files, and restore of built, cut and damaged snapshots
 # With the `fuzz` preset (Clang only) each target gets a libFuzzer executable. In every
 # other preset a replay executable runs the saved inputs in its seeds and regressions
 # folders as a normal test.
@@ -40,6 +41,13 @@ target_include_directories(litbook_journal_fuzz_target
 target_link_libraries(litbook_journal_fuzz_target
     PUBLIC litbook::litbook PRIVATE litbook::warnings)
 
+add_library(litbook_snapshot_fuzz_target STATIC snapshot_fuzzer.cpp)
+target_include_directories(litbook_snapshot_fuzz_target
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/tests)  # for unwrap
+target_link_libraries(litbook_snapshot_fuzz_target
+    PUBLIC litbook::litbook PRIVATE litbook::warnings)
+
 if(LITBOOK_FUZZ)
     add_executable(book_fuzzer libfuzzer_main.cpp)
     target_link_libraries(book_fuzzer PRIVATE litbook_fuzz_target litbook::warnings)
@@ -60,6 +68,10 @@ if(LITBOOK_FUZZ)
     add_executable(journal_fuzzer libfuzzer_main.cpp)
     target_link_libraries(journal_fuzzer PRIVATE litbook_journal_fuzz_target litbook::warnings)
     target_link_options(journal_fuzzer PRIVATE -fsanitize=fuzzer)
+
+    add_executable(snapshot_fuzzer libfuzzer_main.cpp)
+    target_link_libraries(snapshot_fuzzer PRIVATE litbook_snapshot_fuzz_target litbook::warnings)
+    target_link_options(snapshot_fuzzer PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(LITBOOK_BUILD_TESTS)
@@ -106,4 +118,13 @@ if(LITBOOK_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/journal_seeds
             ${CMAKE_CURRENT_SOURCE_DIR}/journal_regressions)
     set_tests_properties(JournalFuzzCorpusReplay PROPERTIES TIMEOUT 300)
+
+    add_executable(litbook_snapshot_fuzz_replay replay_main.cpp)
+    target_link_libraries(litbook_snapshot_fuzz_replay
+        PRIVATE litbook_snapshot_fuzz_target litbook::warnings)
+    add_test(NAME SnapshotFuzzCorpusReplay
+        COMMAND litbook_snapshot_fuzz_replay
+            ${CMAKE_CURRENT_SOURCE_DIR}/snapshot_seeds
+            ${CMAKE_CURRENT_SOURCE_DIR}/snapshot_regressions)
+    set_tests_properties(SnapshotFuzzCorpusReplay PROPERTIES TIMEOUT 300)
 endif()

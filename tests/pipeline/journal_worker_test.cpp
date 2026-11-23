@@ -8,8 +8,12 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "pipeline/pipeline_test_support.hpp"
@@ -294,6 +298,146 @@ TEST_F(JournalWorkerTest, ABlockingWorkerSleepsUntilItsDoorbellRings) {
     EXPECT_EQ(drain_out().size(), 4U);
     EXPECT_TRUE(worker.stopped());
     EXPECT_EQ(scan().records, 4U);
+}
+
+}  // namespace
+}  // namespace litbook::pipeline
+
+namespace litbook::pipeline {
+namespace {
+
+// Remembers every closed segment the worker reports.
+class SegmentRecorder final : public SegmentListener {
+public:
+    void on_segment_closed(journal::Sequence first, journal::Sequence next) noexcept override {
+        closed.emplace_back(first, next);
+    }
+    std::vector<std::pair<journal::Sequence, journal::Sequence>> closed;
+};
+
+// A worker on a journal directory with real system calls and segments of a few records.
+class JournalWorkerSegmentTest : public ::testing::Test {
+protected:
+    void make(std::uint64_t records_per_segment) {
+        journal::JournalWriterConfig config;
+        config.buffer_capacity = std::size_t{1} << 16U;
+        worker_ =
+            std::make_unique<Worker>(journal::JournalWriter::create(paths_.segment(1), config), in_,
+                                     out_, WaitMode::Spin, nullptr, nullptr, &failures_,
+                                     SegmentOptions{.records_per_segment = records_per_segment,
+                                                    .paths = &paths_,
+                                                    .listener = &segments_});
+    }
+
+    void push_orders(std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            ++user_ref_;
+            ASSERT_TRUE(
+                in_.try_push(request_of(1, limit(Side::Buy, user_ref_, 10, 100), 1000 + i)));
+        }
+    }
+
+    [[nodiscard]] journal::JournalScan scan(journal::Sequence first) {
+        const journal::MappedFile file(paths_.segment(first));
+        return journal::scan_journal(file.bytes());
+    }
+
+    [[nodiscard]] bool exists(journal::Sequence first) {
+        return std::filesystem::exists(paths_.segment(first));
+    }
+
+    litbook::testing::TempDir dir_;
+    journal::PathBuffer paths_{dir_.path()};
+    Queue in_{1024};
+    Queue out_{1024};
+    Listener failures_;
+    SegmentRecorder segments_;
+    protocol::UserRefNum user_ref_ = 0;
+    std::unique_ptr<Worker> worker_;
+};
+
+TEST_F(JournalWorkerSegmentTest, ASegmentIsClosedAfterTheBatchThatFillsIt) {
+    make(5);
+    push_orders(3);
+    ASSERT_TRUE(worker_->step());
+    EXPECT_TRUE(segments_.closed.empty());
+    EXPECT_FALSE(exists(4));
+
+    // This batch of 3 takes the segment to 6 records. It stays whole in segment 1, and
+    // the next segment starts at record 7.
+    push_orders(3);
+    ASSERT_TRUE(worker_->step());
+    ASSERT_EQ(segments_.closed.size(), 1U);
+    EXPECT_EQ(segments_.closed[0], std::make_pair(journal::Sequence{1}, journal::Sequence{7}));
+    EXPECT_EQ(scan(1).records, 6U);
+    EXPECT_EQ(scan(1).tail, journal::TailStatus::Clean);
+    EXPECT_EQ(scan(7).records, 0U);
+    EXPECT_EQ(out_.size_approx(), 6U);
+
+    push_orders(5);
+    ASSERT_TRUE(worker_->step());
+    ASSERT_EQ(segments_.closed.size(), 2U);
+    EXPECT_EQ(segments_.closed[1], std::make_pair(journal::Sequence{7}, journal::Sequence{12}));
+    EXPECT_EQ(scan(7).records, 5U);
+    EXPECT_EQ(failures_.calls, 0);
+}
+
+TEST_F(JournalWorkerSegmentTest, WithoutSegmentsTheJournalStaysOneFile) {
+    make(0);
+    for (int round = 0; round < 10; ++round) {
+        push_orders(10);
+        ASSERT_TRUE(worker_->step());
+    }
+    EXPECT_TRUE(segments_.closed.empty());
+    EXPECT_EQ(scan(1).records, 100U);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(dir_.path()),
+                            std::filesystem::directory_iterator()),
+              1);
+}
+
+TEST_F(JournalWorkerSegmentTest, NoNewSegmentIsStartedAfterStop) {
+    make(1);
+    push_orders(2);
+    ASSERT_TRUE(in_.try_push(make_stop_request(5000)));
+    ASSERT_TRUE(worker_->step());
+    EXPECT_TRUE(worker_->stopped());
+    EXPECT_TRUE(segments_.closed.empty());
+    EXPECT_EQ(scan(1).records, 3U);
+}
+
+TEST_F(JournalWorkerSegmentTest, AFailedRotationStopsTheJournalLikeAFailedWrite) {
+    make(2);
+    // Something already took the name of the next segment, so creating it fails.
+    {
+        std::ofstream(paths_.segment(3)) << "x";
+    }
+    push_orders(2);
+    ASSERT_TRUE(worker_->step());
+    EXPECT_TRUE(worker_->failed());
+    EXPECT_EQ(worker_->failure(), journal::JournalStatus::WriteFailed);
+    EXPECT_EQ(failures_.calls, 1);
+    EXPECT_TRUE(segments_.closed.empty());
+    // The batch itself was committed before the rotation, so it went on.
+    EXPECT_EQ(out_.size_approx(), 2U);
+
+    push_orders(1);
+    ASSERT_TRUE(in_.try_push(make_stop_request(6000)));
+    while (worker_->step()) {
+    }
+    EXPECT_TRUE(worker_->stopped());
+    EXPECT_EQ(worker_->stats().discarded, 1U);
+    EXPECT_EQ(out_.size_approx(), 3U);  // The two orders and Stop.
+}
+
+TEST(JournalWorkerSegmentOptionsTest, SegmentsWithoutAPathBufferAreRefused) {
+    const litbook::testing::TempDir dir;
+    Queue in(16);
+    Queue out(16);
+    EXPECT_THROW(
+        Worker(journal::JournalWriter::create(dir.file("j"), journal::JournalWriterConfig{}), in,
+               out, WaitMode::Spin, nullptr, nullptr, nullptr,
+               SegmentOptions{.records_per_segment = 10}),
+        std::invalid_argument);
 }
 
 }  // namespace

@@ -3,6 +3,8 @@
 #include "litbook/book/order_book.hpp"
 #include "litbook/engine/engine_listener.hpp"
 #include "litbook/engine/ticker.hpp"
+#include "litbook/journal/journal_format.hpp"
+#include "litbook/journal/setup.hpp"
 #include "litbook/pipeline/messages.hpp"
 #include "litbook/protocol/codec.hpp"
 #include "litbook/protocol/messages.hpp"
@@ -206,6 +208,22 @@ void set_up_exchange(protocol::OrderEntry<Book>& orders) {
         orders.add_symbol(litbook::testing::unwrap(make_ticker(name)), replay_book_config());
     }
     orders.set_risk_limits(kLimitedOwner, kLimitedRisk);
+}
+
+// The setup records of the exchange that set_up_exchange builds, as a journal holds them.
+inline std::vector<JournalRecord> replay_setup_records() {
+    std::vector<JournalRecord> setup;
+    setup.push_back(session_start_record(replay_order_entry_config()));
+    SymbolId id = 0;
+    for (const char* name : kReplayStocks) {
+        setup.push_back(
+            add_symbol_record(SymbolListing{.id = id,
+                                            .ticker = litbook::testing::unwrap(make_ticker(name)),
+                                            .config = replay_book_config()}));
+        ++id;
+    }
+    setup.push_back(risk_limits_record(kLimitedOwner, kLimitedRisk));
+    return setup;
 }
 
 // Everything that can be seen about the state of two order entry layers must agree, each

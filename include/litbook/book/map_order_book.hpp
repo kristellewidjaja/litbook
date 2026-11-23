@@ -75,8 +75,21 @@ public:
     // Checks every invariant listed above in O(number of orders) time. Meant for tests.
     [[nodiscard]] bool check_invariants() const;
 
+    // Snapshot calls (see the OrderBook concept). for_each_resting visits one side's
+    // orders, best price first and in priority order within a price.
+    template <class Visit>
+    void for_each_resting(Side side, Visit&& visit) const;
+
+    // Puts one order at the back of its price's queue, with no event and no matching.
+    // Returns why it refused, and then changes nothing. This is a startup call that
+    // allocates like any insert into a std::map.
+    RestoreStatus restore_resting(const RestingOrder& order);
+
+    [[nodiscard]] MatchId next_match_id() const noexcept { return next_match_id_; }
+    void restore_next_match_id(MatchId next) noexcept { next_match_id_ = next; }
+
 private:
-    struct RestingOrder {
+    struct QueuedOrder {
         OrderId id;
         OwnerId owner;
         Qty remaining;
@@ -84,7 +97,7 @@ private:
     };
 
     struct Level {
-        std::list<RestingOrder> orders;  // The front order has the highest priority and fills next.
+        std::list<QueuedOrder> orders;  // The front order has the highest priority and fills next.
         AggregateQty total_qty = 0;
     };
 
@@ -95,7 +108,7 @@ private:
     struct Location {
         Side side;
         Price price;
-        std::list<RestingOrder>::iterator order;
+        std::list<QueuedOrder>::iterator order;
     };
 
     // An incoming order (a new order, or a modify that lost priority) while it matches.
@@ -127,6 +140,10 @@ private:
     void cancel_front(Level& level, Side side, Price price, CancelReason reason);
 
     void rest(const Aggressor& aggressor, bool post_only);
+    // Links an order at the back of its price's queue and indexes it, without any event.
+    // Both rest() and restore_resting() use it, so a restored order is stored exactly
+    // like one that came to rest after matching.
+    const Level& place(const RestingOrder& order);
     void emit_level_update(Side side, Price price, const Level& level);
 
     template <class Levels>
@@ -139,6 +156,28 @@ private:
     std::unordered_map<OrderId, Location> index_;
     MatchId next_match_id_ = 1;
 };
+
+template <class Visit>
+void MapOrderBook::for_each_resting(Side side, Visit&& visit) const {
+    // begin() is the best price on both sides, see BidLevels and AskLevels.
+    auto visit_side = [&](const auto& levels) {
+        for (const auto& [price, level] : levels) {
+            for (const QueuedOrder& order : level.orders) {
+                visit(RestingOrder{.id = order.id,
+                                   .owner = order.owner,
+                                   .side = side,
+                                   .price = price,
+                                   .remaining = order.remaining,
+                                   .post_only = order.post_only});
+            }
+        }
+    };
+    if (side == Side::Buy) {
+        visit_side(bids_);
+    } else {
+        visit_side(asks_);
+    }
+}
 
 static_assert(OrderBook<MapOrderBook>);
 
