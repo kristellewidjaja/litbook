@@ -148,8 +148,10 @@ public:
         }
     }
 
-    // The schedule, the drain and the logout (stages 2 to 4 in load_run.hpp).
-    void run(std::uint64_t start) noexcept {
+    // The schedule, the drain and the logout (stages 2 to 4 in load_run.hpp). `drained`
+    // counts the client threads that have finished their first drain, out of `threads`.
+    void run(std::uint64_t start, std::atomic<std::uint32_t>& drained,
+             std::uint32_t threads) noexcept {
         start_ = start;
         schedule_end_ = config_.warmup_ns + config_.pass_ns * config_.passes;
         while (now_ns() < start_) {
@@ -174,7 +176,26 @@ public:
             const std::uint64_t share = share_of(due, s->index, config_.accounts.size());
             s->counters.unsent = share > s->sent ? share - s->sent : 0;
         }
+        const std::uint64_t drain_begin = now_ns();
         drain();
+        // A session on another thread may still trade with our resting orders until its
+        // own fence is answered, and the replies about those trades come to our sessions.
+        // So nobody logs out until every thread has finished its first drain. By then the
+        // exchange has handled every request of the run. A second fence per session then
+        // proves that every reply sent to it before that point has been read.
+        drained.fetch_add(1, std::memory_order_acq_rel);
+        while (drained.load(std::memory_order_acquire) < threads) {
+            const std::uint64_t now = now_ns();
+            for (auto& s : slots_) {
+                if (s->session.active()) {
+                    s->session.tick(now);
+                    flush(*s);
+                }
+            }
+            poll();
+        }
+        drain();
+        drain_ns_ = now_ns() - drain_begin;
         const std::uint64_t now = now_ns();
         for (auto& s : slots_) {
             s->counters.unanswered = s->in_flight.size();
@@ -242,6 +263,7 @@ private:
     }
 
     // Sends each session a fence and reads until every queue is empty or time is up.
+    // fence_answered then says whether this latest fence got its reply.
     void drain() noexcept {
         const std::uint64_t begin = now_ns();
         const std::uint64_t deadline = begin + config_.drain_timeout_ns;
@@ -256,6 +278,7 @@ private:
                                                  .sent_ns = begin});
                 ++s->counters.sent[static_cast<std::size_t>(RequestKind::Fence)];
                 s->fence_sent = true;
+                s->fence_answered = false;
             }
         }
         std::uint64_t now = begin;
@@ -274,7 +297,6 @@ private:
             poll();
             now = now_ns();
         }
-        drain_ns_ = now_ns() - begin;
     }
 
     // Reads every socket that has something to read, without waiting.
@@ -425,6 +447,7 @@ LoadResult run_load(const LoadConfig& config) {
     }
 
     std::atomic<std::uint32_t> ready{0};
+    std::atomic<std::uint32_t> drained{0};
     std::atomic<std::uint64_t> start{0};
     std::vector<char> in_time(config.threads, 0);
     const std::uint64_t login_deadline = now_ns() + config.login_timeout_ns;
@@ -441,7 +464,7 @@ LoadResult run_load(const LoadConfig& config) {
             while ((s = start.load(std::memory_order_acquire)) == 0) {
                 std::this_thread::yield();
             }
-            workers[w]->run(s);
+            workers[w]->run(s, drained, config.threads);
         });
     }
     while (ready.load(std::memory_order_acquire) < config.threads) {

@@ -38,12 +38,16 @@ std::string load_name(std::size_t i) {
 
 class LocalExchange {
 public:
-    explicit LocalExchange(std::size_t accounts, const protocol::RiskLimits& limits = {})
+    // read_chunk_bytes is the most the gateway reads from one socket per poll (see
+    // GatewayConfig).
+    explicit LocalExchange(std::size_t accounts, const protocol::RiskLimits& limits = {},
+                           std::size_t read_chunk_bytes = std::size_t{64} * 1024)
         : sessions_(gateway::SessionConfig{},
                     protocol::OrderEntryConfig{.max_owners = static_cast<OwnerId>(accounts),
                                                .max_live_orders = 1U << 16U,
                                                .max_symbols = 1}),
-          gateway_(sessions_, gateway::GatewayConfig{.port = 0}) {
+          gateway_(sessions_,
+                   gateway::GatewayConfig{.port = 0, .read_chunk_bytes = read_chunk_bytes}) {
         for (std::size_t i = 1; i <= accounts; ++i) {
             const std::string name = load_name(i);
             (void)sessions_.add_account(gateway::AccountConfig{.username = name,
@@ -58,8 +62,11 @@ public:
     [[nodiscard]] std::uint16_t port() const { return gateway_.port(); }
 
     // Runs the load on another thread and serves it from this one. Afterwards keeps
-    // serving until the disconnects have canceled every order, or a deadline passes.
-    LoadResult run(const LoadConfig& config) {
+    // serving until the disconnects have canceled every order, or a deadline passes. A
+    // serve gap makes the gateway sleep between polls, so requests pile up and each poll
+    // handles a burst of them, as a busy exchange does.
+    LoadResult run(const LoadConfig& config,
+                   std::chrono::microseconds serve_gap = std::chrono::microseconds(0)) {
         std::atomic<bool> done{false};
         LoadResult result;
         std::exception_ptr error;
@@ -73,6 +80,9 @@ public:
         });
         while (!done.load(std::memory_order_acquire)) {
             (void)gateway_.poll_once(1);
+            if (serve_gap.count() > 0) {
+                std::this_thread::sleep_for(serve_gap);
+            }
         }
         client.join();
         if (error) {
@@ -83,6 +93,20 @@ public:
             (void)gateway_.poll_once(1);
         }
         return result;
+    }
+
+    // Why the gateway closed connections, one line per reason, so a failed health check
+    // also says what the exchange saw.
+    [[nodiscard]] std::string closes() const {
+        std::string out;
+        for (std::size_t r = 0; r < gateway::kCloseReasonCount; ++r) {
+            const std::uint64_t n = sessions_.stats().closes[r];
+            if (n != 0) {
+                out += "gateway closed " + std::to_string(n) + " connections for reason " +
+                       std::to_string(r) + " (see CloseReason)\n";
+            }
+        }
+        return out;
     }
 
     [[nodiscard]] std::uint32_t live_orders() const {
@@ -130,7 +154,7 @@ TEST(LoadRunTest, HealthyRunAgreesWithTheExchange) {
     const LoadResult result = exchange.run(config);
 
     const auto problems = health_problems(result);
-    EXPECT_TRUE(problems.empty()) << describe(problems);
+    EXPECT_TRUE(problems.empty()) << describe(problems) << exchange.closes();
     ASSERT_EQ(result.sessions.size(), 8U);
     EXPECT_TRUE(result.logins_in_time);
     EXPECT_EQ(exchange.stats().logins_accepted, 8U);
@@ -151,7 +175,8 @@ TEST(LoadRunTest, HealthyRunAgreesWithTheExchange) {
             EXPECT_EQ(s.counters.sent[k], s.counters.answered[k] + s.counters.ignored[k])
                 << s.username << " kind " << k;
         }
-        EXPECT_EQ(s.counters.sent[static_cast<std::size_t>(RequestKind::Fence)], 1U);
+        // Two fences, one before and one after every thread finished its first drain.
+        EXPECT_EQ(s.counters.sent[static_cast<std::size_t>(RequestKind::Fence)], 2U);
         EXPECT_EQ(s.counters.ignored[static_cast<std::size_t>(RequestKind::Enter)], 0U);
         EXPECT_LE(s.counters.max_in_flight, config.max_in_flight);
         scheduled += s.counters.unsent;
@@ -160,7 +185,7 @@ TEST(LoadRunTest, HealthyRunAgreesWithTheExchange) {
         }
         EXPECT_GT(s.first_sequence, 0U);
         EXPECT_EQ(s.next_ref,
-                  s.counters.sent[0] + s.counters.sent[2] + 2);  // From 1, plus the fence.
+                  s.counters.sent[0] + s.counters.sent[2] + 3);  // From 1, plus two fences.
     }
     // Every due request was sent or counted as unsent, and none was made up.
     EXPECT_EQ(scheduled, scheduled_count(config));
@@ -190,6 +215,40 @@ TEST(LoadRunTest, HealthyRunAgreesWithTheExchange) {
 
     // Cancel on disconnect took away every order that was still resting.
     EXPECT_EQ(exchange.live_orders(), 0U);
+}
+
+// Regression test. Each client thread used to log its sessions out as soon as its own
+// fences were answered. A session on another thread could still trade with their resting
+// orders, and the replies about those trades went to a session that had already left, so
+// the run missed one side of some trades. Now no session leaves before every session has
+// seen everything the exchange did. The gateway here reads only about two orders per
+// session per poll and sleeps between polls, so every session ends the schedule with a
+// backlog of a different length, and the sessions with short backlogs see their fences
+// while the others are still trading. Many threads and a mix full of trades make the race
+// likely, and every run must see both sides of every trade.
+TEST(LoadRunTest, EveryTradeIsSeenFromBothSidesWithManyThreads) {
+    for (std::uint64_t round = 0; round < 6; ++round) {
+        LocalExchange exchange(8, protocol::RiskLimits{}, 100);
+        LoadConfig config = small_config(exchange.port(), 8, 4);
+        config.rate = 100'000;
+        config.warmup_ns = 50'000'000;
+        config.pass_ns = 50'000'000;
+        config.passes = 2;
+        config.flow.band_ticks = 2;
+        config.flow.aggressive_percent = 45;
+        config.flow.cancel_percent = 10;
+        config.flow.replace_percent = 5;
+        config.flow.seed = 100 + round * 10;
+        const LoadResult result = exchange.run(config, std::chrono::microseconds(500));
+
+        const auto problems = health_problems(result);
+        ASSERT_TRUE(problems.empty()) << describe(problems) << exchange.closes();
+        const LoadTotals t = totals(result);
+        ASSERT_GT(t.counters.executions, 0U);
+        EXPECT_EQ(t.counters.added, t.counters.removed) << "round " << round;
+        EXPECT_EQ(t.net_position, 0) << "round " << round;
+        EXPECT_EQ(exchange.live_orders(), 0U);
+    }
 }
 
 TEST(LoadRunTest, WrongPasswordFailsOnlyThatSession) {
@@ -239,7 +298,8 @@ TEST(LoadRunTest, OverloadShowsUpAsLagAndUnsentRequests) {
     // those are never timed.
     config.warmup_ns = 0;
     const LoadResult result = exchange.run(config);
-    EXPECT_TRUE(health_problems(result).empty()) << describe(health_problems(result));
+    EXPECT_TRUE(health_problems(result).empty())
+        << describe(health_problems(result)) << exchange.closes();
     const LoadTotals t = totals(result);
     EXPECT_GT(t.counters.unsent, 0U);
     EXPECT_EQ(t.counters.max_in_flight, 1U);
@@ -262,8 +322,14 @@ TEST(LoadRunTest, OpenOrderLimitRejectsAreCountedAndTheFlowRecovers) {
     LocalExchange exchange(2, protocol::RiskLimits{.max_open_orders = 5});
     LoadConfig config = small_config(exchange.port(), 2, 1);
     config.max_live = 40;
+    // No replaces, so that every reject is an open order limit reject. A replace can be
+    // rejected for its size when the order fills more while the replace is on its way
+    // (its size then no longer covers the executed shares), which made this test fail
+    // about one run in six.
+    config.flow.replace_percent = 0;
     const LoadResult result = exchange.run(config);
-    EXPECT_TRUE(health_problems(result).empty()) << describe(health_problems(result));
+    EXPECT_TRUE(health_problems(result).empty())
+        << describe(health_problems(result)) << exchange.closes();
     const LoadTotals t = totals(result);
     EXPECT_GT(t.counters.rejected_open_limit, 0U);
     EXPECT_EQ(t.counters.rejected, t.counters.rejected_open_limit);
@@ -283,7 +349,8 @@ TEST(LoadRunTest, PinnedClientThreadStillWorks) {
     config.passes = 1;
     config.cpus = {0};
     const LoadResult result = exchange.run(config);
-    EXPECT_TRUE(health_problems(result).empty()) << describe(health_problems(result));
+    EXPECT_TRUE(health_problems(result).empty())
+        << describe(health_problems(result)) << exchange.closes();
 }
 
 TEST(LoadRunTest, ConfigsThatCannotWorkAreRefused) {

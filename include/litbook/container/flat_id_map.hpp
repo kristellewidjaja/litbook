@@ -26,11 +26,22 @@ namespace litbook {
 // replay CPU time about 6% lower (see DECISIONS.md D-039). Every bit of the key still
 // reaches the index, so keys that differ only in high bits do not all collide. It is not
 // hardened against adversarial keys, which is fine for exchange-assigned IDs.
+// Entries are kept in Robin Hood order (D-070). Each slot remembers how far its key sits
+// from the key's home slot. An insert that reaches an entry closer to its home than the
+// new key already is puts the new key there and carries the old entry on, so along any
+// run the distances never jump up by more than one from one slot to the next. That lets
+// a lookup stop as soon as it passes an entry closer to home than the key it wants, and
+// it lets an erase stop as soon as the next entry already sits in its home slot.
 // Erase uses backward-shift deletion instead of tombstones (markers left in deleted
-// slots), so the table never fills up with dead slots under heavy churn.
+// slots), so the table never fills up with dead slots under heavy churn. The fold hash
+// gives a range of recent IDs a long run of slots that each hold their own key. Without
+// the Robin Hood order, an erase near the front of such a run had to read every slot to
+// its end, because some later key might have needed to move back.
 //
 // These invariants always hold. size() <= max_entries(). Every stored key is reachable
-// from its home slot without crossing an empty slot. No key is stored twice.
+// from its home slot without crossing an empty slot. No key is stored twice. Each slot's
+// distance is its key's real distance from home, and in a run the next slot's distance
+// is at most one more than this slot's.
 class FlatIdMap {
 public:
     using Key = std::uint64_t;
@@ -51,57 +62,55 @@ public:
     // Stores `value` under `key`. Returns false and changes nothing if the key is already
     // present or the map already holds max_entries() keys. `value` must not be kNotFound.
     bool insert(Key key, Value value) noexcept {
-        if (size_ == max_entries_) {
+        if (size_ == max_entries_ || find_slot(key) != kNoSlot) {
             return false;
         }
-        std::size_t i = home(key);
-        while (slots_[i].value != kNotFound) {
-            if (slots_[i].key == key) {
-                return false;
+        // The entry being placed. It starts as the new key and becomes whichever entry was
+        // moved out of the way.
+        Slot carried{.key = key, .value = value, .distance = 0};
+        for (std::size_t i = home(key);; i = (i + 1) & mask_) {
+            Slot& slot = slots_[i];
+            if (slot.value == kNotFound) {
+                slot = carried;
+                ++size_;
+                return true;
             }
-            i = (i + 1) & mask_;
+            if (slot.distance < carried.distance) {
+                // This entry is closer to its home than the carried one, so the carried
+                // one takes the slot and the old entry looks further on.
+                std::swap(slot, carried);
+            }
+            ++carried.distance;
         }
-        slots_[i] = {.key = key, .value = value};
-        ++size_;
-        return true;
     }
 
     // Returns the value for `key`, or kNotFound.
     [[nodiscard]] Value find(Key key) const noexcept {
-        for (std::size_t i = home(key);; i = (i + 1) & mask_) {
-            if (slots_[i].value == kNotFound) {
-                return kNotFound;  // An empty slot ends every probe sequence.
-            }
-            if (slots_[i].key == key) {
-                return slots_[i].value;
-            }
-        }
+        const std::size_t i = find_slot(key);
+        return i == kNoSlot ? kNotFound : slots_[i].value;
     }
 
     [[nodiscard]] bool contains(Key key) const noexcept { return find(key) != kNotFound; }
 
     // Removes `key`. Returns false if it was not present.
     bool erase(Key key) noexcept {
-        std::size_t hole = home(key);
-        while (slots_[hole].key != key || slots_[hole].value == kNotFound) {
-            if (slots_[hole].value == kNotFound) {
-                return false;
-            }
-            hole = (hole + 1) & mask_;
+        std::size_t hole = find_slot(key);
+        if (hole == kNoSlot) {
+            return false;
         }
-        // Backward shift. Walk the run of entries after the hole and pull back any entry whose
-        // probe path passes through the hole, so no later lookup stops early there.
-        for (std::size_t j = (hole + 1) & mask_; slots_[j].value != kNotFound;
-             j = (j + 1) & mask_) {
-            const std::size_t k = home(slots_[j].key);
-            // The entry at j may move into the hole if and only if the hole lies on its path from
-            // k to j, which means the hole is no further back from j than its home slot k is.
-            if (((j - hole) & mask_) <= ((j - k) & mask_)) {
-                slots_[hole] = slots_[j];
-                hole = j;
-            }
+        // Backward shift. Every entry after the hole that is not in its home slot moves back
+        // by one, so no later lookup stops early at the hole. In Robin Hood order those
+        // entries come right after the hole, and the first empty slot or the first entry
+        // already in its home slot ends them.
+        for (std::size_t next = (hole + 1) & mask_;
+             slots_[next].value != kNotFound && slots_[next].distance > 0;
+             next = (next + 1) & mask_) {
+            ++erase_walk_;
+            slots_[hole] = slots_[next];
+            --slots_[hole].distance;
+            hole = next;
         }
-        slots_[hole].value = kNotFound;
+        slots_[hole] = Slot{};
         --size_;
         return true;
     }
@@ -109,15 +118,18 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     [[nodiscard]] std::size_t max_entries() const noexcept { return max_entries_; }
     [[nodiscard]] std::size_t table_size() const noexcept { return slots_.size(); }
+    // How many entries every erase so far has moved back by one slot. Tests use it to check
+    // that an erase does not walk a whole run of keys.
+    [[nodiscard]] std::uint64_t erase_walk() const noexcept { return erase_walk_; }
 
     // The longest distance any stored key sits from its home slot, found by scanning the
     // whole table in O(table size). A lookup for a key never reads more slots than this
     // plus one, so tests use it to check that keys do not pile up. Meant for tests.
     [[nodiscard]] std::size_t longest_probe() const noexcept {
         std::size_t longest = 0;
-        for (std::size_t i = 0; i < slots_.size(); ++i) {
-            if (slots_[i].value != kNotFound) {
-                longest = std::max(longest, (i - home(slots_[i].key)) & mask_);
+        for (const Slot& slot : slots_) {
+            if (slot.value != kNotFound) {
+                longest = std::max<std::size_t>(longest, slot.distance);
             }
         }
         return longest;
@@ -131,10 +143,20 @@ public:
                 continue;
             }
             ++count;
-            for (std::size_t p = home(slots_[i].key); p != i; p = (p + 1) & mask_) {
+            const std::size_t home_slot = home(slots_[i].key);
+            if (slots_[i].distance != ((i - home_slot) & mask_)) {
+                return false;  // The stored distance is wrong.
+            }
+            for (std::size_t p = home_slot; p != i; p = (p + 1) & mask_) {
                 if (slots_[p].value == kNotFound || slots_[p].key == slots_[i].key) {
                     return false;  // A gap before reaching the key, or a duplicate.
                 }
+            }
+            // In Robin Hood order an entry is at most one step further from home than the
+            // entry before it.
+            const Slot& before = slots_[(i - 1) & mask_];
+            if (slots_[i].distance > 0 && slots_[i].distance > before.distance + 1) {
+                return false;
             }
         }
         return count == size_ && size_ <= max_entries_;
@@ -144,7 +166,28 @@ private:
     struct Slot {
         Key key = 0;
         Value value = kNotFound;  // kNotFound marks an empty slot, because any key value is legal.
+        // How many slots past its home slot the key sits. It fills what would otherwise be
+        // padding, so a slot is still 16 bytes.
+        std::uint32_t distance = 0;
     };
+    static constexpr std::size_t kNoSlot = std::numeric_limits<std::size_t>::max();
+
+    // The slot that holds `key`, or kNoSlot. The search stops at an empty slot, or at an
+    // entry closer to its home than `key` would be there, because in Robin Hood order
+    // `key` would have taken that entry's place.
+    [[nodiscard]] std::size_t find_slot(Key key) const noexcept {
+        std::uint32_t distance = 0;
+        for (std::size_t i = home(key);; i = (i + 1) & mask_) {
+            const Slot& slot = slots_[i];
+            if (slot.value == kNotFound || slot.distance < distance) {
+                return kNoSlot;
+            }
+            if (slot.key == key) {
+                return i;
+            }
+            ++distance;
+        }
+    }
 
     // The slot where a key's probe sequence starts.
     [[nodiscard]] std::size_t home(Key key) const noexcept {
@@ -158,6 +201,7 @@ private:
     std::vector<Slot> slots_;
     std::size_t mask_ = 0;
     int bits_ = 0;  // width of a table index, log2 of the table size
+    std::uint64_t erase_walk_ = 0;
     std::size_t size_ = 0;
     std::size_t max_entries_;
 };

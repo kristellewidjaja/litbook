@@ -19,8 +19,14 @@
 //    it was due, and requests due during the warm up are not timed.
 // 3. Drain. Each session sends a fence, an order that is always rejected, so its reply
 //    proves that every earlier request was handled. The thread keeps reading until every
-//    session's queue is empty or drain_timeout_ns has passed.
-// 4. Logout. Each session logs out and its socket is closed.
+//    session's queue is empty or drain_timeout_ns has passed. Then it keeps reading until
+//    every other thread has done the same, because a session on another thread may still
+//    trade with this thread's resting orders until its own fence is answered. Once all
+//    threads are there, the exchange has handled every request of the run, and each
+//    session sends a second fence. Its reply proves that every reply sent to the session
+//    before it has been read, including the ones about those late trades.
+// 4. Logout. Each session logs out and its socket is closed. No session logs out while
+//    another one can still trade with it.
 //
 // For each request kind and pass there are two histograms. Response time runs from the
 // time the request was due to the moment its first reply had been read. That is what a
@@ -103,7 +109,7 @@ struct SessionResult {
     std::uint64_t unknown_replies = 0;
     std::int64_t position = 0;
     std::size_t live_at_end = 0;
-    bool fence_answered = false;
+    bool fence_answered = false;  // The session's last fence got its reply.
     // The UserRefNum a later run of the same account must start from.
     protocol::UserRefNum next_ref = 0;
 };
@@ -123,7 +129,7 @@ struct LoadResult {
     std::vector<PassLatency> passes;
     // From the end of the logins to the end of the schedule, as measured.
     std::uint64_t schedule_ns = 0;
-    std::uint64_t drain_ns = 0;
+    std::uint64_t drain_ns = 0;  // Both fences and the wait between them.
     // True if every client thread finished its logins before login_timeout_ns.
     bool logins_in_time = false;
 };

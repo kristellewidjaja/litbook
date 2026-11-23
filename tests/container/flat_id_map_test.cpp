@@ -128,6 +128,33 @@ TEST(FlatIdMapTest, SequentialKeysDoNotPileUp) {
     EXPECT_LT(map.longest_probe(), 64U);
 }
 
+// Regression test. Sequential keys each get their own home slot, so a few hundred live
+// orders with nearby IDs form one long run of slots. Erasing a key near the front of that
+// run used to read every slot to the end of the run, even though no key had to move. A
+// load test that canceled its oldest orders spent most of the matching thread's time
+// there. An erase must stop as soon as the next key already sits in its home slot.
+TEST(FlatIdMapTest, EraseInARunOfSequentialKeysIsShort) {
+    constexpr FlatIdMap::Key kFirst = 1'000'000;
+    constexpr FlatIdMap::Key kCount = 1'000;
+    FlatIdMap map(4'096);
+    for (FlatIdMap::Key k = kFirst; k < kFirst + kCount; ++k) {
+        ASSERT_TRUE(map.insert(k, static_cast<FlatIdMap::Value>(k - kFirst)));
+    }
+    ASSERT_EQ(map.longest_probe(), 0U);  // One run, every key in its home slot.
+
+    ASSERT_TRUE(map.erase(kFirst));
+    EXPECT_LE(map.erase_walk(), 1U);
+
+    // Taking the oldest key each time, as a client canceling its oldest orders does, stays
+    // short for every erase.
+    for (FlatIdMap::Key k = kFirst + 1; k < kFirst + kCount; ++k) {
+        ASSERT_TRUE(map.erase(k));
+    }
+    EXPECT_LE(map.erase_walk(), kCount);
+    EXPECT_EQ(map.size(), 0U);
+    EXPECT_TRUE(map.check_invariants());
+}
+
 // Random insert/erase/find against std::unordered_map, with keys from a small range
 // so the same keys come and go many times (the backward-shift erase is exercised hard).
 TEST(FlatIdMapTest, RandomChurnMatchesUnorderedMap) {

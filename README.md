@@ -57,13 +57,15 @@ Measured on an Apple M3 Pro, inside a Linux virtual machine under Docker, so tre
 
 | What | Result |
 |---|---|
-| FastOrderBook, rest an order and cancel it | 12.6 ns per operation |
+| FastOrderBook, rest an order and cancel it | 25.2 ns per operation |
 | A full ITCH trading day through MapOrderBook | 347.2 ns per book message |
 | One client message through the order entry layer, 100,000 live orders | 184.7 ns |
 | TCP round trip through the single-threaded gateway, spin mode, p50 | 9.46 us |
 | TCP round trip through the threaded pipeline with the journal, spin mode, p50 | 13.3 us |
 | From an order on TCP to its price level on the multicast feed, spin mode, p50 | 3.7 us |
 | Recovery from a journal of 4 million requests, without and with snapshots | 551 ms and 18.6 ms |
+| Load test, 8 client sessions, highest rate held with p99 under 1 ms: single thread, pipeline with feed, pipeline with journal | 3.2, 4.8 and 2.4 million requests/s |
+| Load test at 400,000 requests/s, p50 / p99: single thread, pipeline with feed, pipeline with journal | 7.4 / 20.5, 42.0 / 81.9 and 55.3 / 112.6 us |
 
 ## Tools
 
@@ -79,7 +81,7 @@ Measured on an Apple M3 Pro, inside a Linux virtual machine under Docker, so tre
 
 ## Still to come
 
-Measurements with the load generator, Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
+Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
 
 ## Building
 
