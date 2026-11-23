@@ -1,17 +1,21 @@
 // litbook_gateway runs the exchange as a TCP server that clients reach with SoupBinTCP
 // and OUCH-style messages (docs/PROTOCOL.md).
 //
-//   litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... [--symbol TICKER]...
-//                   [--max-order-qty N] [--max-open-orders N]
+//   litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... [--load-accounts N]
+//                   [--symbol TICKER]... [--max-order-qty N] [--max-open-orders N]
 //                   [--feed INTERFACE] [--feed-incremental ADDRESS:PORT]
 //                   [--feed-snapshot ADDRESS:PORT] [--journal DIRECTORY] [--sync write|sync]
 //                   [--segment-records N] [--keep-snapshots K] [--snapshot-thread on|off]
 //
 // --port 0 lets the kernel pick a free port. The first line printed is always
 // "litbook_gateway listening on 127.0.0.1:PORT", so scripts and tests can find the port.
-// ":cod" after an account turns on cancel on disconnect for it. Without --account there is
-// one account, test/test. Without --symbol the only stock is AAPL. Every stock uses a $0.01
-// tick, a lot size of 1, and room for 65,536 resting orders.
+// ":cod" after an account turns on cancel on disconnect for it. --load-accounts N adds N
+// accounts for litbook_loadgen, named L00001 to L0000N (up to 10,000) with the password
+// "load" and cancel on disconnect, so a load run leaves no orders behind. They come after
+// the --account ones. Without any account there is one, test/test. The gateway takes 16
+// more connections than there are accounts, and at least 64. Without --symbol the only
+// stock is AAPL. Every stock uses a $0.01 tick, a lot size of 1, and room for 65,536
+// resting orders.
 //
 // Without --feed the whole exchange runs on one thread, as in Phase 6. With --feed it
 // runs on the three-thread pipeline of Phase 7 in blocking mode, and the publisher thread
@@ -60,6 +64,7 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <csignal>
@@ -98,9 +103,21 @@ struct Account {
     bool cancel_on_disconnect = false;
 };
 
+// The most accounts --load-accounts makes. Their names have 5 digits.
+constexpr std::uint64_t kMaxLoadAccounts = 10'000;
+
+// Load account i (from 1) is L00001 and so on, with the password "load" and cancel on
+// disconnect. SoupBinTCP usernames have at most 6 characters.
+Account load_account(std::uint64_t i) {
+    std::array<char, 8> name{};
+    (void)std::snprintf(name.data(), name.size(), "L%05u", static_cast<unsigned>(i));
+    return Account{.username = name.data(), .password = "load", .cancel_on_disconnect = true};
+}
+
 struct Options {
     std::uint16_t port = 15000;
     std::vector<Account> accounts;
+    std::uint64_t load_accounts = 0;
     std::vector<std::string> symbols;
     litbook::protocol::RiskLimits limits;
     // Set by --feed. The groups have their defaults until a --feed-* flag changes them.
@@ -181,6 +198,9 @@ bool parse_options(int argc, char** argv, Options& o) {
                 return false;
             }
             o.accounts.push_back(a);
+        } else if (flag == "--load-accounts" && parse_unsigned(value, kMaxLoadAccounts, number) &&
+                   number > 0) {
+            o.load_accounts = number;
         } else if (flag == "--symbol") {
             o.symbols.emplace_back(value);
         } else if (flag == "--max-order-qty" && parse_unsigned(value, 0xFFFF'FFFFULL, number)) {
@@ -238,6 +258,9 @@ bool parse_options(int argc, char** argv, Options& o) {
     if (o.feed && o.feed_snapshot) {
         o.feed->snapshot = *o.feed_snapshot;
     }
+    for (std::uint64_t i = 1; i <= o.load_accounts; ++i) {
+        o.accounts.push_back(load_account(i));
+    }
     if (o.accounts.empty()) {
         o.accounts.push_back(Account{.username = "test", .password = "test"});
     }
@@ -259,6 +282,14 @@ void print_session_stats(const litbook::gateway::SessionStats& stats, std::uint3
         static_cast<unsigned long long>(stats.messages_dropped), live_orders);
 }
 
+// One connection for every account, plus room for clients that have not logged in yet.
+litbook::gateway::SessionConfig session_config(const Options& o) {
+    litbook::gateway::SessionConfig c;
+    c.max_connections = std::max<std::uint32_t>(c.max_connections,
+                                                static_cast<std::uint32_t>(o.accounts.size()) + 16);
+    return c;
+}
+
 litbook::protocol::OrderEntryConfig order_entry_config(const Options& o) {
     return {.max_owners = static_cast<litbook::OwnerId>(o.accounts.size()),
             .max_live_orders = 1U << 20U,
@@ -276,7 +307,7 @@ const litbook::BookConfig kBookConfig{.tick_size = 100, .max_orders = 1U << 16U}
 
 // The Phase 6 server, everything on this thread.
 int run_single_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers) {
-    Manager sessions(litbook::gateway::SessionConfig{}, order_entry_config(o));
+    Manager sessions(session_config(o), order_entry_config(o));
     for (const Account& a : o.accounts) {
         sessions.add_account(account_config(o, a));
     }
@@ -429,7 +460,7 @@ int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
         const bool possible = journal->records_per_segment > 0 && journal->keep_snapshots > 0;
         journal->snapshot_thread = o.snapshot_thread.value_or(possible);
     }
-    Exchange exchange(litbook::gateway::SessionConfig{}, order_entry_config(o),
+    Exchange exchange(session_config(o), order_entry_config(o),
                       litbook::gateway::GatewayConfig{.port = o.port},
                       litbook::pipeline::PipelineConfig{.wait = litbook::pipeline::WaitMode::Block},
                       publisher_options, journal ? &*journal : nullptr);
@@ -490,12 +521,13 @@ int run_with_feed(const Options& o, const litbook::feed::FeedNetworkConfig& netw
 int main(int argc, char** argv) try {
     Options o;
     if (!parse_options(argc, argv, o)) {
-        std::fprintf(stderr,
-                     "usage: litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... "
-                     "[--symbol TICKER]... [--max-order-qty N] [--max-open-orders N] "
-                     "[--feed INTERFACE] [--feed-incremental ADDRESS:PORT] "
-                     "[--feed-snapshot ADDRESS:PORT] [--journal DIRECTORY] [--sync write|sync] "
-                     "[--segment-records N] [--keep-snapshots K] [--snapshot-thread on|off]\n");
+        std::fprintf(
+            stderr,
+            "usage: litbook_gateway [--port N] [--account USER:PASSWORD[:cod]]... "
+            "[--load-accounts N] [--symbol TICKER]... [--max-order-qty N] [--max-open-orders N] "
+            "[--feed INTERFACE] [--feed-incremental ADDRESS:PORT] "
+            "[--feed-snapshot ADDRESS:PORT] [--journal DIRECTORY] [--sync write|sync] "
+            "[--segment-records N] [--keep-snapshots K] [--snapshot-thread on|off]\n");
         return 2;
     }
     std::vector<litbook::Ticker> tickers;

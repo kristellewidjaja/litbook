@@ -50,6 +50,10 @@ add_library(litbook STATIC
     src/journal/setup.cpp
     src/journal/snapshot_format.cpp
     src/journal/snapshot_store.cpp
+    src/loadgen/client_session.cpp
+    src/loadgen/load_report.cpp
+    src/loadgen/load_run.cpp
+    src/loadgen/order_flow.cpp
     src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
 add_library(litbook::litbook ALIAS litbook)

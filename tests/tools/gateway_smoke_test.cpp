@@ -97,6 +97,49 @@ TEST(GatewayProgram, AcceptsALoginAndAnOrderThenStopsCleanly) {
     EXPECT_NE(summary.find("live orders 0"), std::string::npos) << summary;
 }
 
+TEST(GatewayProgram, LoadAccountsCanLogIn) {
+    GatewayProcess gateway({"--port", "0", "--load-accounts", "3"});
+    const std::uint16_t port = gateway.port();
+    // L00003 is the last one made, and L00004 does not exist.
+    TestClient third(port);
+    EXPECT_EQ(third.send_some(testing::login("L00003", "load")), 49U);
+    const auto accepted = wait_for_packet(third);
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(litbook::testing::unwrap(accepted).type, soup::PacketType::LoginAccepted);
+    TestClient fourth(port);
+    EXPECT_EQ(fourth.send_some(testing::login("L00004", "load")), 49U);
+    const auto rejected = wait_for_packet(fourth);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(litbook::testing::unwrap(rejected).type, soup::PacketType::LoginRejected);
+    // With load accounts there is no test/test account.
+    TestClient test(port);
+    EXPECT_EQ(test.send_some(testing::login("test", "test")), 49U);
+    const auto refused = wait_for_packet(test);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(litbook::testing::unwrap(refused).type, soup::PacketType::LoginRejected);
+    EXPECT_EQ(gateway.stop(SIGINT), 0);
+}
+
+TEST(GatewayProgram, ManyLoadAccountsGetEnoughConnections) {
+    // 100 accounts need more than the default 64 connection slots.
+    GatewayProcess gateway({"--port", "0", "--load-accounts", "100"});
+    const std::uint16_t port = gateway.port();
+    std::vector<std::unique_ptr<TestClient>> clients;
+    for (int i = 1; i <= 100; ++i) {
+        std::array<char, 8> name{};
+        (void)std::snprintf(name.data(), name.size(), "L%05d", i);
+        clients.push_back(std::make_unique<TestClient>(port));
+        EXPECT_EQ(clients.back()->send_some(testing::login(name.data(), "load")), 49U);
+    }
+    for (auto& c : clients) {
+        const auto accepted = wait_for_packet(*c);
+        ASSERT_TRUE(accepted.has_value());
+        EXPECT_EQ(litbook::testing::unwrap(accepted).type, soup::PacketType::LoginAccepted);
+    }
+    EXPECT_EQ(gateway.stop(SIGINT), 0);
+    EXPECT_NE(gateway.line().find("logins 100,"), std::string::npos);
+}
+
 TEST(GatewayProgram, StopsOnSigterm) {
     GatewayProcess gateway({"--port", "0"});
     (void)gateway.port();
@@ -108,6 +151,8 @@ TEST(GatewayProgram, RejectsBadArguments) {
          {std::vector<std::string>{"--port"}, std::vector<std::string>{"--port", "70000"},
           std::vector<std::string>{"--account", "nopassword"},
           std::vector<std::string>{"--symbol", "toolongticker"},
+          std::vector<std::string>{"--load-accounts", "0"},
+          std::vector<std::string>{"--load-accounts", "10001"},
           std::vector<std::string>{"--frobnicate", "1"}}) {
         GatewayProcess gateway(args);
         // The program exits by itself. Signal 0 sends nothing, so stop() just waits.

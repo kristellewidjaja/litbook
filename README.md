@@ -72,13 +72,14 @@ Measured on an Apple M3 Pro, inside a Linux virtual machine under Docker, so tre
 | `litbook_gateway` | Runs the exchange, with optional journal, snapshots and market data feed |
 | `litbook_feed_listener` | Joins the multicast feed and keeps books from it |
 | `litbook_journal` | Verifies, dumps or replays a journal, and writes a snapshot offline |
+| `litbook_loadgen` | Logs in many client sessions to a running gateway, sends orders on a fixed schedule and reports latency percentiles per request type |
 | `litbook_itch_replay`, `litbook_itch_stats` | Replay a Nasdaq ITCH 5.0 file through a book, or summarize one |
 | `litbook_bench` | Google Benchmark microbenchmarks of every component |
 | `litbook_latency`, `litbook_gateway_latency`, `litbook_queue_latency`, `litbook_feed_latency`, `litbook_feed_recovery`, `litbook_journal_recovery` | Latency percentiles and recovery times |
 
 ## Still to come
 
-A C++ load generator with many sessions, Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
+Measurements with the load generator, Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
 
 ## Building
 

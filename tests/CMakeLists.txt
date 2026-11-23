@@ -35,6 +35,12 @@ add_executable(litbook_tests
     gateway/session_test.cpp
     gateway/soup_test.cpp
     itch/binary_file_reader_test.cpp
+    loadgen/client_session_test.cpp
+    loadgen/in_flight_queue_test.cpp
+    loadgen/load_report_test.cpp
+    loadgen/load_run_test.cpp
+    loadgen/order_flow_test.cpp
+    loadgen/pacer_test.cpp
     itch/book_builder_test.cpp
     itch/itch_parser_test.cpp
     journal/crc32c_test.cpp
