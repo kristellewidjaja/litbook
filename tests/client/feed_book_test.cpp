@@ -13,9 +13,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "feed/feed_test_support.hpp"
@@ -49,21 +49,37 @@ FeedBookConfig book_config(const char* incremental, const char* snapshot) {
     return c;
 }
 
+// Passes packets on to the real sink only while connected is true, like a network cable,
+// so a test can lose packets for certain instead of hoping the kernel drops some.
+class SwitchSink final : public feed::FeedSink {
+public:
+    explicit SwitchSink(feed::FeedSink& target) : target_(&target) {}
+    void send(feed::FeedStream stream, std::span<const std::byte> packet) override {
+        if (connected) {
+            target_->send(stream, packet);
+        }
+    }
+    bool connected = true;
+
+private:
+    feed::FeedSink* target_;
+};
+
 class FeedBookTest : public ::testing::Test {
 protected:
     // Makes the book first, because the publisher must be told the ports it got.
-    void make(const char* incremental, const char* snapshot, int receive_buffer = 0) {
-        FeedBookConfig c = book_config(incremental, snapshot);
-        c.receiver.receive_buffer = receive_buffer;
+    void make(const char* incremental, const char* snapshot) {
+        const FeedBookConfig c = book_config(incremental, snapshot);
         book_ = std::make_unique<FeedBook>(c);
         FeedNetworkConfig network;
         network.incremental = {.address = incremental, .port = book_->incremental_port()};
         network.snapshot = {.address = snapshot, .port = book_->snapshot_port()};
         sink_ = std::make_unique<UdpFeedSink>(network);
+        cable_ = std::make_unique<SwitchSink>(*sink_);
         FeedPublisherConfig config;
         config.session = "BOOK";
         config.snapshot_spacing = kSpacing;
-        publisher_ = std::make_unique<FeedPublisher>(*sink_, config);
+        publisher_ = std::make_unique<FeedPublisher>(*cable_, config);
         for (const char* name : {"AAPL", "MSFT"}) {
             (void)publisher_->add_symbol({.symbol = ticker(name),
                                           .tick_size = kTick,
@@ -100,6 +116,7 @@ protected:
     Timestamp now_ = 1'000;
     std::unique_ptr<FeedBook> book_;
     std::unique_ptr<UdpFeedSink> sink_;
+    std::unique_ptr<SwitchSink> cable_;
     std::unique_ptr<FeedPublisher> publisher_;
 };
 
@@ -175,28 +192,38 @@ TEST_F(FeedBookTest, WaitUpdateReturnsAtOnceForANewVersionAndWaitsOtherwise) {
     EXPECT_EQ(book_->wait_update(before, 5'000), book_->version());
 }
 
-// A receive buffer far too small for a burst makes the kernel drop packets. The book must
-// say a stock is stale while it waits, and come back live from the snapshots.
+// Packets lost on the way make the book see a gap. Every stock must then say it is stale,
+// keep answering from its last copy, and come back live from the snapshots. (A first
+// version hoped the kernel would drop packets from a burst into a tiny receive buffer, and
+// on CI's release build the reader kept up, so nothing was lost.)
 TEST_F(FeedBookTest, LostPacketsMakeStocksStaleUntilSnapshotsRepairThem) {
-    make("239.255.79.7", "239.255.79.8", 4096);
+    make("239.255.79.7", "239.255.79.8");
     publisher_->start(now_);
-    ASSERT_TRUE(wait_for([&] { return book_->symbols().size() == 2; }));
-    // The reader thread cannot keep up with this many packets in a 4 KB buffer.
-    for (int i = 0; i < 4'000; ++i) {
-        const auto locate = static_cast<feed::Locate>(i % 2);
-        const Price price = (900 + (i % 40)) * kTick;
-        level(locate, Side::Buy, price, 100U + static_cast<unsigned>(i), 1);
-        if (i % 10 == 9) {
-            publisher_->flush(now_);
-        }
-    }
+    level(0, Side::Buy, 1'000 * kTick, 100, 1);
     publisher_->flush(now_);
-    // A final packet after a pause shows the book where the stream is now.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(wait_for([&] { return !book_->depth("AAPL", Side::Buy, 10).empty(); }));
+
+    // These packets never arrive.
+    cable_->connected = false;
+    for (int i = 0; i < 20; ++i) {
+        const auto locate = static_cast<feed::Locate>(i % 2);
+        level(locate, Side::Buy, (900 + i) * kTick, 100U + static_cast<unsigned>(i), 1);
+        publisher_->flush(now_);
+    }
+    cable_->connected = true;
+    // The next packet shows the book that it missed some.
     level(1, Side::Sell, 1'500 * kTick, 5, 1);
     publisher_->flush(now_);
 
     ASSERT_TRUE(wait_for([&] { return book_->stats().handler.gaps >= 1; }));
+    // No snapshot has been sent yet, so both stocks wait for one.
+    EXPECT_EQ(book_->status("AAPL"), SymbolStatus::Stale);
+    EXPECT_EQ(book_->status("MSFT"), SymbolStatus::Stale);
+    EXPECT_TRUE(book_->stats().recovering);
+    const Quote stale = testing::unwrap(book_->best("AAPL"));
+    EXPECT_FALSE(stale.live);
+    EXPECT_EQ(testing::unwrap(stale.bid).price, 1'000 * kTick);  // The last good copy.
+
     ASSERT_TRUE(wait_for(
         [&] {
             const FeedBookStats s = book_->stats();
