@@ -14,6 +14,9 @@ add_executable(litbook_tests
     book/sorted_order_book_test.cpp
     book/differential_test.cpp
     book/book_restore_test.cpp
+    client/feed_book_test.cpp
+    client/order_client_test.cpp
+    client/order_tracker_test.cpp
     concurrency/mutex_queue_test.cpp
     concurrency/queue_contract_test.cpp
     concurrency/spsc_queue_test.cpp

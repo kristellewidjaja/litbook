@@ -16,4 +16,13 @@ T unwrap(const std::optional<T>& value) {
     return *value;
 }
 
+// The same for a pointer the test expects to be set, such as the result of a find.
+template <class T>
+const T& unwrap_ptr(const T* pointer) {
+    if (pointer == nullptr) {
+        throw std::logic_error("expected a pointer to something, but it was null");
+    }
+    return *pointer;
+}
+
 }  // namespace litbook::testing

@@ -11,11 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build \
         gdb \
         git ca-certificates \
-        python3 \
+        python3 python3-dev \
         linux-perf \
     && rm -rf /var/lib/apt/lists/*
 # llvm provides llvm-symbolizer, so sanitizer stack traces show file:line.
 # libclang-rt-dev holds Clang's sanitizer and libFuzzer runtimes.
+# python3-dev holds the Python headers that the pybind11 module is built against.
 # linux-perf provides perf. On Ubuntu 26.04 it is a single binary that is not tied to
 # one kernel version, so it works with Docker Desktop's own kernel. That VM exposes no
 # hardware counters, so profile with software events (perf record -e cpu-clock).

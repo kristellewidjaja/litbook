@@ -17,10 +17,26 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Sanitizers)    # must come before any target so everything is instrumented
 include(Fuzzing)
 include(Warnings)
+
+# The Python module (python/) loads into an uninstrumented python3 process, which cannot
+# host ThreadSanitizer at all and needs AddressSanitizer preloaded (DECISIONS.md D-071).
+# So it is built only without sanitizers. The C++ classes it wraps are in the library and
+# their GoogleTest tests run in every preset.
+if(LITBOOK_SANITIZER OR LITBOOK_FUZZ)
+    set(litbook_python_default OFF)
+else()
+    set(litbook_python_default ON)
+endif()
+option(LITBOOK_BUILD_PYTHON "Build the pybind11 Python module" ${litbook_python_default})
+if(LITBOOK_BUILD_PYTHON AND (LITBOOK_SANITIZER OR LITBOOK_FUZZ))
+    message(FATAL_ERROR "LITBOOK_BUILD_PYTHON cannot be combined with sanitizers or fuzzing")
+endif()
+
 include(Dependencies)
 
-# Core library
-add_library(litbook STATIC
+# Core library. The source list is kept in a variable because the Python module needs a
+# second copy of the library built as position independent code (see below).
+set(LITBOOK_SOURCES
     src/version.cpp
     src/book/book_config.cpp
     src/book/events.cpp
@@ -28,6 +44,9 @@ add_library(litbook STATIC
     src/book/map_order_book.cpp
     src/book/order_book.cpp
     src/book/sorted_order_book.cpp
+    src/client/feed_book.cpp
+    src/client/order_client.cpp
+    src/client/order_tracker.cpp
     src/concurrency/thread_affinity.cpp
     src/engine/engine.cpp
     src/feed/feed_codec.cpp
@@ -56,12 +75,23 @@ add_library(litbook STATIC
     src/loadgen/order_flow.cpp
     src/pipeline/doorbell.cpp
     src/protocol/codec.cpp)
+add_library(litbook STATIC ${LITBOOK_SOURCES})
 add_library(litbook::litbook ALIAS litbook)
 target_include_directories(litbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The pipeline (Phase 7) starts threads, so everything that uses the library links the
 # system thread library.
 find_package(Threads REQUIRED)
 target_link_libraries(litbook PUBLIC Threads::Threads PRIVATE litbook::warnings)
+
+# A shared library such as the Python module can only link code compiled with -fPIC. The
+# main library keeps its usual code generation, so every recorded benchmark still measures
+# the same code, and the module gets this copy instead.
+if(LITBOOK_BUILD_PYTHON)
+    add_library(litbook_pic STATIC ${LITBOOK_SOURCES})
+    set_target_properties(litbook_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(litbook_pic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(litbook_pic PUBLIC Threads::Threads PRIVATE litbook::warnings)
+endif()
 
 # Tests and benchmarks
 if(LITBOOK_BUILD_TESTS)
@@ -78,6 +108,10 @@ if(LITBOOK_BUILD_TESTS OR LITBOOK_FUZZ)
 endif()
 
 add_subdirectory(tools)
+
+if(LITBOOK_BUILD_PYTHON)
+    add_subdirectory(python)
+endif()
 
 # These are optional local practice exercises, not part of the repository. Their tests
 # carry the label "exercise" and are excluded from the normal test presets.

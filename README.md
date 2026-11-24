@@ -79,9 +79,28 @@ Measured on an Apple M3 Pro, inside a Linux virtual machine under Docker, so tre
 | `litbook_bench` | Google Benchmark microbenchmarks of every component |
 | `litbook_latency`, `litbook_gateway_latency`, `litbook_queue_latency`, `litbook_feed_latency`, `litbook_feed_recovery`, `litbook_journal_recovery` | Latency percentiles and recovery times |
 
+## Python
+
+The `litbook` Python module (pybind11) has a blocking order entry client and a book kept from the market data feed. Prices are integer ticks with 4 implied decimals, as on the wire, so 1,000,000 is $100.00.
+```python
+# Against a gateway started with: litbook_gateway --account ALICE:pw --feed lo
+import litbook
+
+with litbook.OrderClient("127.0.0.1", 15000, "ALICE", "pw") as client:
+    reply = client.enter("AAPL", litbook.Side.Buy, 100, 1_000_000)  # Accepted or Rejected
+    for event in client.events(timeout_ms=100):                      # executions and cancels
+        print(event)
+    client.cancel(reply.user_ref)  # Canceled, or None if the order already filled
+
+book = litbook.FeedBook()          # joins the default feed groups on lo
+book.wait_update(0, 1000)
+print(book.best("AAPL"), book.depth("AAPL", litbook.Side.Sell, levels=5))
+```
+The `debug` and `release` presets build it into `build/<preset>/python/` (add that folder to `PYTHONPATH`). The sanitizer presets do not build it, because a sanitizer runtime cannot be loaded into a normal Python process (D-071).
+
 ## Still to come
 
-Python bindings through pybind11 with a market maker, a noise trader and a live book viewer, and a design document that follows one order from socket to trade print.
+A Python market maker, a noise trader and a live book viewer built on the Python module, and a design document that follows one order from socket to trade print.
 
 ## Building
 
