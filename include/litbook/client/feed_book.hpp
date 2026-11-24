@@ -15,6 +15,8 @@
 // A symbol is known once its Symbol Directory message arrived, on either stream. Its
 // levels are right only while it is live. While it is stale (after a gap, until its
 // snapshot arrives) best() and depth() still answer, from the last good copy, and say so.
+// A book that joined late counts as stale until it has read the incremental stream once,
+// because only then can it notice the updates it missed.
 //
 // Invariants. Only the reader thread touches the receiver, and only while holding the
 // mutex, so every read sees the books as of one whole packet. version() only grows. The
@@ -48,7 +50,7 @@ struct FeedBookConfig {
 enum class SymbolStatus : std::uint8_t {
     Unknown,  // No Symbol Directory message for it yet.
     Live,     // The book is right as of the last message.
-    Stale,    // A gap happened and the book waits for a snapshot.
+    Stale,    // A gap happened, or nothing was read on the incremental stream yet.
 };
 
 [[nodiscard]] const char* to_string(SymbolStatus status) noexcept;
@@ -109,6 +111,8 @@ private:
     void run();
     // The locate of a known symbol. Called with the mutex held.
     [[nodiscard]] std::optional<feed::Locate> find(std::string_view symbol) const;
+    // Live in the handler, and the incremental stream was read at least once. Needs the mutex.
+    [[nodiscard]] bool live(feed::Locate locate) const;
 
     feed::FeedReceiver receiver_;
     int wait_ms_;

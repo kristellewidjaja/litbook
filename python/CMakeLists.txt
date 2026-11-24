@@ -10,14 +10,15 @@ target_link_libraries(litbook_python PRIVATE litbook_pic litbook::warnings)
 # The Python tests start a real litbook_gateway and talk to it through the module. Each
 # file is its own ctest test, so they can run in parallel. Every gateway listens on a port
 # the kernel picks and sends its feed to ports the test's own receiver picked, so parallel
-# runs never share a port.
+# runs never share a port. The bots in litbook_bots/ are plain Python, so the source
+# folder goes on PYTHONPATH next to the module's build folder.
 if(LITBOOK_BUILD_TESTS)
-    foreach(name order_client feed_book)
+    foreach(name order_client feed_book prices market_maker noise_trader book_view simulate)
         add_test(NAME Python.${name}
             COMMAND Python::Interpreter -m unittest discover
                 -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_${name}.py -v)
         set_tests_properties(Python.${name} PROPERTIES
             TIMEOUT 120
-            ENVIRONMENT "PYTHONPATH=$<TARGET_FILE_DIR:litbook_python>;PYTHONDONTWRITEBYTECODE=1;LITBOOK_GATEWAY=$<TARGET_FILE:litbook_gateway>")
+            ENVIRONMENT "PYTHONPATH=$<TARGET_FILE_DIR:litbook_python>:${CMAKE_CURRENT_SOURCE_DIR};PYTHONDONTWRITEBYTECODE=1;LITBOOK_GATEWAY=$<TARGET_FILE:litbook_gateway>")
     endforeach()
 endif()

@@ -99,7 +99,15 @@ SymbolStatus FeedBook::status(std::string_view symbol) const {
     if (!locate) {
         return SymbolStatus::Unknown;
     }
-    return receiver_.handler().live(*locate) ? SymbolStatus::Live : SymbolStatus::Stale;
+    return live(*locate) ? SymbolStatus::Live : SymbolStatus::Stale;
+}
+
+bool FeedBook::live(feed::Locate locate) const {
+    // A receiver that joined late can learn a stock from the snapshot stream first. The
+    // handler counts it as live then, but it only notices the updates it missed when the
+    // first incremental packet shows the gap, so until then the book is not trusted.
+    const feed::FeedHandler& handler = receiver_.handler();
+    return handler.live(locate) && handler.stats().incremental_packets > 0;
 }
 
 std::optional<Quote> FeedBook::best(std::string_view symbol) const {
@@ -111,7 +119,7 @@ std::optional<Quote> FeedBook::best(std::string_view symbol) const {
     const feed::FeedHandler& handler = receiver_.handler();
     const feed::LevelBook* book = handler.book(*locate);
     return Quote{
-        .bid = book->best(Side::Buy), .ask = book->best(Side::Sell), .live = handler.live(*locate)};
+        .bid = book->best(Side::Buy), .ask = book->best(Side::Sell), .live = live(*locate)};
 }
 
 std::vector<feed::PriceLevel> FeedBook::depth(std::string_view symbol, Side side,

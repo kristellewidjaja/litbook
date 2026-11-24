@@ -243,6 +243,43 @@ TEST_F(FeedBookTest, LostPacketsMakeStocksStaleUntilSnapshotsRepairThem) {
     }
 }
 
+// A receiver that joins after the session started can learn the stocks from the snapshot
+// stream before it has read anything on the incremental stream. Until it has, it cannot know
+// that it missed level updates, so no stock may say it is live. (Found by the Python book
+// view, which printed an empty book as live for about half a second after it started.)
+TEST_F(FeedBookTest, ALateJoinerIsNotLiveBeforeItHasReadTheIncrementalStream) {
+    make("239.255.79.21", "239.255.79.22");
+    // Everything up to here is lost, as if the book had not joined yet.
+    cable_->connected = false;
+    publisher_->start(now_);
+    level(0, Side::Buy, 1'000 * kTick, 100, 1);
+    publisher_->flush(now_);
+    cable_->connected = true;
+
+    // Only the snapshot stream speaks, so the book learns the stocks from it.
+    ASSERT_TRUE(wait_for([&] { return book_->symbols().size() == 2; }, [&] { next_snapshot(); }));
+    EXPECT_EQ(book_->stats().handler.incremental_packets, 0U);
+    EXPECT_EQ(book_->status("AAPL"), SymbolStatus::Stale);
+    EXPECT_EQ(book_->status("MSFT"), SymbolStatus::Stale);
+    EXPECT_FALSE(testing::unwrap(book_->best("AAPL")).live);
+
+    // The first incremental packet shows the gap, and the snapshots then make both stocks live,
+    // with the level that never arrived on the incremental stream.
+    level(1, Side::Sell, 1'500 * kTick, 5, 1);
+    publisher_->flush(now_);
+    ASSERT_TRUE(wait_for(
+        [&] {
+            return book_->status("AAPL") == SymbolStatus::Live &&
+                   book_->status("MSFT") == SymbolStatus::Live;
+        },
+        [&] { next_snapshot(); }));
+    EXPECT_GE(book_->stats().handler.gaps, 1U);
+    const Quote aapl = testing::unwrap(book_->best("AAPL"));
+    EXPECT_TRUE(aapl.live);
+    EXPECT_EQ(testing::unwrap(aapl.bid).price, 1'000 * kTick);
+    EXPECT_EQ(testing::unwrap(testing::unwrap(book_->best("MSFT")).ask).price, 1'500 * kTick);
+}
+
 TEST_F(FeedBookTest, EndOfSessionIsSeenAndStopKeepsTheLastBooks) {
     make("239.255.79.9", "239.255.79.10");
     publisher_->start(now_);

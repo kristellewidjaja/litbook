@@ -98,9 +98,27 @@ print(book.best("AAPL"), book.depth("AAPL", litbook.Side.Sell, levels=5))
 ```
 The `debug` and `release` presets build it into `build/<preset>/python/` (add that folder to `PYTHONPATH`). The sanitizer presets do not build it, because a sanitizer runtime cannot be loaded into a normal Python process (D-071).
 
+### Bots and a simulated market
+
+`python/litbook_bots/` is a small package of bots written on top of the module (D-072).
+
+| Module | What it does |
+|---|---|
+| `market_maker` | Keeps one post-only bid and one offer around a fair value taken from the other traders' best prices, leans its quotes against its position and stops buying or selling at a position limit. It requotes with OUCH Replace and pulls its quotes while the feed is not live. |
+| `noise_trader` | Sends random orders at exponentially distributed times from a seeded generator, a mix of IOC orders that take liquidity, resting limit orders a few ticks behind the middle, and cancels. |
+| `book_view` | A live terminal view of one stock's book from the feed (curses), or one printed picture with `--once`. |
+| `simulate` | Starts `litbook_gateway` with its feed on loopback, runs makers and noise traders as threads, then checks that every match was seen by both sides, positions add up to zero, the feed printed one trade per match, the feed's book equals the bots' open orders, and the book is empty once they log out. |
+
+```sh
+export PYTHONPATH=build/release/python:python
+python3 -m litbook_bots.simulate --seconds 20 --makers 1 --noise 4 --seed 1 \
+    --gateway build/release/tools/litbook_gateway --view
+```
+Each module keeps its decisions (quotes, inventory skew, the next random order, the picture of the book) in plain functions, separate from the loop that waits on the network, and the tests check those functions with plain values and the loops with stand-in clients.
+
 ## Still to come
 
-A Python market maker, a noise trader and a live book viewer built on the Python module, and a design document that follows one order from socket to trade print.
+A design document that follows one order from socket to trade print.
 
 ## Building
 
