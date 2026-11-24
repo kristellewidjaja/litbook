@@ -21,7 +21,9 @@
 // runs on the three-thread pipeline of Phase 7 in blocking mode, and the publisher thread
 // sends the market data feed (docs/FEED.md) by UDP multicast on that interface, by default
 // to 239.255.0.1:15100 (incremental) and 239.255.0.2:15101 (snapshots). The second line
-// printed then says where the feed goes. litbook_feed_listener reads it.
+// printed then says where the feed goes and names the feed's session, which a receiver
+// must be given (litbook_feed_listener --session) when it is not 1. A gateway without a
+// journal always starts session 1, and every restart from a journal starts a new one.
 //
 // With --journal the exchange also runs on the pipeline, with a fourth thread that writes
 // every request to the journal before the matching thread handles it (docs/JOURNAL.md).
@@ -77,6 +79,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -441,6 +444,17 @@ bool wait_for_stop(int signal_fd, int finished_fd) {
     }
 }
 
+// The name of the feed's session, which start() sets. Only FeedExchange has a feed, so
+// every other exchange gives an empty name, and run_threaded never prints it for them.
+template <class Exchange>
+std::string feed_session([[maybe_unused]] const Exchange& exchange) {
+    if constexpr (std::is_same_v<Exchange, FeedExchange>) {
+        return exchange.publisher().feed().session();
+    } else {
+        return {};
+    }
+}
+
 // The pipeline, with the market data feed if `feed` is set and a journal if the options
 // name one. It runs in blocking mode.
 template <class Exchange>
@@ -476,10 +490,14 @@ int run_threaded(const Options& o, const std::vector<litbook::Ticker>& tickers,
     std::printf("litbook_gateway listening on 127.0.0.1:%u\n",
                 static_cast<unsigned>(exchange.port()));
     if (feed != nullptr) {
-        std::printf("litbook_gateway feed on %s: incremental %s:%u, snapshot %s:%u\n",
+        // Receivers only accept packets of the session they expect, and a restart from a
+        // journal starts a new one, so the line names it. start() has already set it, and
+        // the publisher thread never changes it afterwards.
+        const std::string session = feed_session(exchange);
+        std::printf("litbook_gateway feed on %s: incremental %s:%u, snapshot %s:%u, session %s\n",
                     feed->interface_name.c_str(), feed->incremental.address.c_str(),
                     static_cast<unsigned>(feed->incremental.port), feed->snapshot.address.c_str(),
-                    static_cast<unsigned>(feed->snapshot.port));
+                    static_cast<unsigned>(feed->snapshot.port), session.c_str());
     }
     if (journal) {
         print_recovery(journal->directory, exchange.recovery());

@@ -252,7 +252,7 @@ If a write or a sync fails, the batch is not passed on, the exchange ends the se
 5. replays every later record into it, counting the replies of each account and giving the level updates to the market data feed's copy of the books, without sending anything;
 6. cuts off a torn last record and resumes the last segment;
 7. writes a Restart record and a Cancel All for every account with cancel on disconnect, flushes them, and then applies the cancels;
-8. sets every account's next sequence number to 1 plus its replies, and names the feed's new session after the Restart record's sequence number;
+8. sets every account's next sequence number to 1 plus its replies, and names the feed's new session after the Restart record's sequence number, which the gateway prints at the end of its feed line (`session 7`) so that receivers can be pointed at it;
 9. writes the start snapshot and removes what it makes unnecessary.
 
 Then it starts the threads and keeps appending to the last segment. A directory without segments is a new journal, unless it holds snapshots, which refuses the start. A segment that holds only the 32-byte header counts as no record. A journal that ends inside its setup records (a crash during the very first start) gets the missing ones.

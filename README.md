@@ -62,7 +62,7 @@ An exchange takes orders from clients over the network, matches buyers with sell
 
 Without a journal or a feed, `litbook_gateway` can also run the gateway and matching on one thread, which is the baseline the threaded pipeline is measured against.
 
-After a crash, the exchange starts from the newest good snapshot and replays only the journal records after it. Every account's sequence numbers continue where they stopped, and the feed starts a new session so receivers rebuild their books.
+After a crash, the exchange starts from the newest good snapshot and replays only the journal records after it. Every account's sequence numbers continue where they stopped, and the feed starts a new session so receivers rebuild their books. The gateway prints the new session's name, and the feed tools take it with `--session`.
 
 ## The order books
 

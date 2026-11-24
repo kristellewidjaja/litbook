@@ -89,6 +89,9 @@ TEST(FeedListenerProgram, ShowsTheGatewaysOrdersAndEndsWithTheSession) {
     EXPECT_NE(feed_line.find("litbook_gateway feed on lo: incremental 239.255.81.1:"),
               std::string::npos)
         << feed_line;
+    // Receivers only accept packets of the session they expect, so the gateway names it.
+    // A gateway without a journal always starts session 1.
+    EXPECT_TRUE(feed_line.ends_with(", session 1")) << feed_line;
 
     ASSERT_GT(client.send_some(login("alice", "secret")), 0U);
     ASSERT_TRUE(read_packets(client, 1));  // Login Accepted.

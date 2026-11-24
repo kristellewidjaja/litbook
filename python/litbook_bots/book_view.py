@@ -122,6 +122,8 @@ def main(argv=None):
     parser.add_argument("--interface", default="lo")
     parser.add_argument("--incremental", default="239.255.0.1:15100")
     parser.add_argument("--snapshot", default="239.255.0.2:15101")
+    parser.add_argument("--session", default="1",
+                        help="the feed session, as litbook_gateway prints it on its feed line")
     parser.add_argument("--once", action="store_true",
                         help="wait until the stock is live, print one picture and exit")
     parser.add_argument("--plain", type=float, metavar="SECONDS",
@@ -132,7 +134,7 @@ def main(argv=None):
     inc_addr, inc_port = args.incremental.rsplit(":", 1)
     snap_addr, snap_port = args.snapshot.rsplit(":", 1)
     with litbook.FeedBook(args.interface, inc_addr, int(inc_port), snap_addr,
-                          int(snap_port)) as feed:
+                          int(snap_port), args.session) as feed:
         if args.once:
             live = wait_live(feed, args.symbol, args.wait)
             print("\n".join(snapshot(feed, args.symbol, args.levels)))

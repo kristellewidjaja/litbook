@@ -2,8 +2,11 @@
 a stand in screen, and --once as a separate process reading a real gateway's feed."""
 
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -117,6 +120,40 @@ class BookViewProcessTest(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertEqual(lines[0], "AAPL  Live  spread 0.02  mid 100.01  trades 0")
         self.assertEqual(lines[2], "      1      300     100.00 | 100.02          100       1")
+
+    def test_once_follows_an_exchange_that_restarted_from_its_journal(self):
+        # A restart names a new feed session after the journal's Restart record. The
+        # gateway prints the name on its feed line, and --session tells the view which
+        # session to read, so the view sees the book that recovery rebuilt.
+        feed = litbook.FeedBook(incremental_address="239.255.84.1", incremental_port=0,
+                                snapshot_address="239.255.84.2", snapshot_port=0)
+        self.addCleanup(feed.stop)
+        incremental = f"239.255.84.1:{feed.incremental_port}"
+        snapshot_group = f"239.255.84.2:{feed.snapshot_port}"
+        journal = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, journal, True)
+        args = ["--feed", "lo", "--feed-incremental", incremental, "--feed-snapshot",
+                snapshot_group, "--journal", journal]
+        first = GatewayProcess(args)
+        with litbook.OrderClient("127.0.0.1", first.port, "ALICE", "pw") as alice:
+            alice.enter("AAPL", litbook.Side.Buy, 300, PRICE)
+        self.assertEqual(first.stop(), 0)
+
+        again = GatewayProcess(args)
+        self.addCleanup(again.stop)
+        feed_line = again.process.stdout.readline()
+        match = re.search(r", session (\S+)$", feed_line.rstrip())
+        self.assertIsNotNone(match, feed_line)
+        self.assertNotEqual(match.group(1), "1")
+        result = subprocess.run(
+            [sys.executable, "-m", "litbook_bots.book_view", "--once",
+             "--incremental", incremental, "--snapshot", snapshot_group,
+             "--session", match.group(1), "--wait", "10"],
+            capture_output=True, text=True, timeout=30, env=os.environ)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], "AAPL  Live  trades 0")
+        self.assertEqual(lines[2].rstrip(), "      1      300     100.00 |")
 
 
 if __name__ == "__main__":

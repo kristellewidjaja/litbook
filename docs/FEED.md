@@ -56,6 +56,8 @@ To watch the feed of a running exchange on one machine:
 
 The listener prints each stock's best levels every second. It exits with 0 at End of Session, and with 3 if the feed goes silent (rule 9) after it was heard.
 
+A receiver only accepts packets of the session it expects (rule 8), which is `1` unless it is told otherwise. A gateway without a journal always starts session `1`. A gateway that restarts from its journal starts a new session named after the journal's Restart record (docs/JOURNAL.md), so the receivers of the old session hear nothing more and the new session's receivers rebuild their books from snapshots. The gateway's second line names the session, for example `litbook_gateway feed on lo: incremental 239.255.0.1:15100, snapshot 239.255.0.2:15101, session 7`, and `litbook_feed_listener --session 7` or `python3 -m litbook_bots.book_view --session 7` then follows it.
+
 ## Data types
 
 | Type | Width | Encoding |
